@@ -694,7 +694,7 @@ app.get('/api/books', authenticateToken, async (req, res) => {
     const orgIds = activeMemberships.map(m => m.organizationId);
     const books = await prisma.book.findMany({
       where: { organizationId: { in: orgIds } },
-      include: { organization: { select: { id: true, name: true, isPersonal: true } } }
+      include: { organization: { select: { id: true, name: true, isPersonal: true, imageUrl: true } } }
     });
 
     const booksWithRole = books.map(book => {
