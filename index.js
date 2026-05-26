@@ -700,6 +700,8 @@ app.get('/api/books', authenticateToken, async (req, res) => {
     });
 
     const activeMemberships = user.memberships.filter(m => m.status === 'active');
+    const pendingMemberships = user.memberships.filter(m => m.status === 'pending');
+
     const orgIds = activeMemberships.map(m => m.organizationId);
     const books = await prisma.book.findMany({
       where: { organizationId: { in: orgIds } },
@@ -708,10 +710,35 @@ app.get('/api/books', authenticateToken, async (req, res) => {
 
     const booksWithRole = books.map(book => {
       const membership = activeMemberships.find(m => m.organizationId === book.organizationId);
-      return { ...book, role: membership?.role || 'member', permissions: membership?.permissions || [] };
+      return { 
+        ...book, 
+        role: membership?.role || 'member', 
+        permissions: membership?.permissions || [],
+        status: 'active'
+      };
     });
 
-    res.json(booksWithRole);
+    // Include mock pending books for pending memberships so they show in the list with a pending state
+    const pendingOrgIds = pendingMemberships.map(m => m.organizationId);
+    const pendingOrgs = pendingOrgIds.length > 0 ? await prisma.organization.findMany({
+      where: { id: { in: pendingOrgIds } },
+      select: { id: true, name: true, imageUrl: true, isPersonal: true }
+    }) : [];
+
+    const pendingBooks = pendingOrgs.map(org => ({
+      id: `pending_${org.id}`,
+      name: org.name,
+      organizationId: org.id,
+      organization: { id: org.id, name: org.name, isPersonal: org.isPersonal, imageUrl: org.imageUrl },
+      role: 'member',
+      permissions: [],
+      balance: 0.0,
+      isDefault: false,
+      parentBookId: null,
+      status: 'pending'
+    }));
+
+    res.json([...booksWithRole, ...pendingBooks]);
   } catch (error) {
     console.error('Fetch books error:', error);
     res.status(500).json({ error: 'Server error fetching books' });
