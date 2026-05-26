@@ -3518,11 +3518,19 @@ Multiple transactions:
 The DATA block will be rendered as beautiful cards/tables by the app.
 
 ## CREATING TRANSACTIONS
-When user describes daily expenses with details:
-1. Parse the description and break into multiple logical transactions
-2. Show them in a DATA type:transactions block
-3. Include action block for EACH transaction at the end
-4. Ask user to confirm
+When user describes daily expenses/income:
+1. First check if all required details are present:
+   - **Amount** (the numerical value of transaction, e.g. 500 BDT)
+   - **Target Book** (must clearly correspond to one of USER'S BOOKS by ID or name; ask to clarify if ambiguous or unspecified)
+2. If any of the required details above is missing, incomplete, or ambiguous:
+   - **DO NOT** output the '[DATA type:transactions]' block.
+   - **DO NOT** output any action blocks.
+   - Instead, reply to the user asking them politely to specify the missing information (e.g., "কত টাকা খরচ হয়েছে?" or "কোন হিসাব খাতায় এটি যোগ করব?").
+3. ONLY when all details are fully specified:
+   - Parse the description and break into multiple logical transactions.
+   - Show them in a DATA type:transactions block.
+   - Include action block for EACH transaction at the end.
+   - Ask user to confirm.
 
 Action block format (MULTIPLE allowed, one per transaction):
 
@@ -3811,11 +3819,19 @@ Multiple transactions:
 The DATA block will be rendered as beautiful cards/tables by the app.
 
 ## CREATING TRANSACTIONS
-When user describes daily expenses with details:
-1. Parse the description and break into multiple logical transactions
-2. Show them in a DATA type:transactions block
-3. Include action block for EACH transaction at the end
-4. Ask user to confirm
+When user describes daily expenses/income:
+1. First check if all required details are present:
+   - **Amount** (the numerical value of transaction, e.g. 500 BDT)
+   - **Target Book** (must clearly correspond to one of USER'S BOOKS by ID or name; ask to clarify if ambiguous or unspecified)
+2. If any of the required details above is missing, incomplete, or ambiguous:
+   - **DO NOT** output the '[DATA type:transactions]' block.
+   - **DO NOT** output any action blocks.
+   - Instead, reply to the user asking them politely to specify the missing information (e.g., "কত টাকা খরচ হয়েছে?" or "কোন হিসাব খাতায় এটি যোগ করব?").
+3. ONLY when all details are fully specified:
+   - Parse the description and break into multiple logical transactions.
+   - Show them in a DATA type:transactions block.
+   - Include action block for EACH transaction at the end.
+   - Ask user to confirm.
 
 Action block format (MULTIPLE allowed, one per transaction):
 
