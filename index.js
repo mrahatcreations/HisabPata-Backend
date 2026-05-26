@@ -1064,7 +1064,29 @@ app.put('/api/transactions/:id', authenticateToken, async (req, res) => {
 
     const user = await prisma.user.findUnique({ where: { id: req.user.id }, select: { name: true } });
 
-    if (txn.reconStatus === 'approved') {
+    // Personal org — edit directly, no pending/approval flow needed
+    const editOrg = await prisma.organization.findUnique({ where: { id: book.organizationId }, select: { isPersonal: true } });
+    if (editOrg?.isPersonal) {
+      // Personal book: direct update, balance adjusted, no approval needed
+      let personalBalAdj = 0;
+      if (changes.amount !== undefined && changes.amount !== txn.amount) {
+        if (txn.type === 'expense') personalBalAdj = txn.amount - parsedAmount;
+        else if (txn.type === 'income') personalBalAdj = parsedAmount - txn.amount;
+      }
+      const personalUpdated = await prisma.$transaction(async (prisma) => {
+        const updatedTxn = await prisma.transaction.update({
+          where: { id: txnId },
+          data: { ...changes, updateHistory: [...(txn.updateHistory || []), { timestamp: new Date().toISOString(), userId: req.user.id, userName: user?.name || 'Unknown', action: 'edit', changes: { old: { amount: txn.amount, type: txn.type, note: txn.note }, new: changes } }] },
+        });
+        if (personalBalAdj !== 0) {
+          await prisma.book.update({ where: { id: book.id }, data: { balance: { increment: personalBalAdj } } });
+        }
+        return updatedTxn;
+      });
+      broadcast({ type: 'data_changed' });
+      const enrichedPersonal = await enrichTxn(personalUpdated);
+      return res.json({ transaction: enrichedPersonal, message: 'Transaction updated' });
+    } else if (txn.reconStatus === 'approved') {
       // Reverse current balance to compute the pre-txn balance
       let preTxnBalance = book.balance;
       if (txn.type === 'expense') {
