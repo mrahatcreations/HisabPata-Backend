@@ -1,12 +1,6 @@
 services:
   backend:
-    build:
-      context: ./backend
-      args:
-        JWT_SECRET: "${JWT_SECRET}"
-        DATABASE_URL: "${DATABASE_URL}"
-        NODE_ENV: "${NODE_ENV:-production}"
-        ADMIN_KEY: "${ADMIN_KEY}"
+    build: .
     ports:
       - "8000:8000"
     environment:
@@ -22,23 +16,12 @@ services:
 
   frontend:
     build:
-      context: ./frontend
+      context: ../frontend
       args:
         API_BASE_URL: "${API_BASE_URL:-http://backend:8000}"
         WS_URL: "${WS_URL:-ws://backend:8000}"
     ports:
       - "3000:3000"
-    depends_on:
-      - backend
-    restart: unless-stopped
-
-  admin_console:
-    build:
-      context: ./admin_console
-    ports:
-      - "3001:3001"
-    environment:
-      - ADMIN_API_URL=${ADMIN_API_URL:-http://backend:8000}
     depends_on:
       - backend
     restart: unless-stopped

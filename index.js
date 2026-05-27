@@ -99,7 +99,7 @@ app.use(cors({
 }));
 app.use(express.json());
 app.use('/uploads', express.static(uploadDir));
-app.use('/admin', express.static(path.join(__dirname, '..', 'admin_console')));
+app.use('/admin', express.static(path.join(__dirname, 'admin_console')));
 
 // Log requests
 app.use((req, res, next) => {
