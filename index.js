@@ -15,6 +15,7 @@ const fs = require('fs');
 require('dotenv').config();
 const { Readable } = require('stream');
 const crypto = require('crypto');
+const sharp = require('sharp');
 
 // ─── S3-Compatible Object Storage (SeaweedFS S3 / MinIO / Cloudflare R2) ─────
 // Set STORAGE_S3_ENDPOINT in .env to enable. Falls back to local /uploads.
@@ -74,9 +75,26 @@ async function uploadToS3(localPath, filename, mimetype, folder) {
   if (!useS3) return null;
   try {
     const resolvedFolder = resolveS3Folder(folder, mimetype, filename);
-    const key            = `${resolvedFolder}/${filename}`;
-    const contentType    = mimetype || 'application/octet-stream';
-    const fileBuffer     = fs.readFileSync(localPath);
+    let key              = `${resolvedFolder}/${filename}`;
+    let contentType      = mimetype || 'application/octet-stream';
+    let fileBuffer       = fs.readFileSync(localPath);
+    
+    // Compress images (keep resolution, reduce file size, convert to webp)
+    if (contentType.startsWith('image/')) {
+      try {
+        fileBuffer = await sharp(fileBuffer)
+          .webp({ quality: 85 }) // High quality WebP (good for documents too)
+          .toBuffer();
+        
+        contentType = 'image/webp';
+        // replace extension with .webp
+        const newFilename = filename.replace(/\.[^/.]+$/, ".webp");
+        key = `${resolvedFolder}/${newFilename}`;
+      } catch (err) {
+        console.error('Sharp compression failed, falling back to original:', err);
+      }
+    }
+
     const now            = new Date();
     const authHeaders    = signS3Request('PUT', key, contentType, fileBuffer, now);
     const uploadRes = await fetch(`${s3Endpoint}/${s3Bucket}/${key}`, {
