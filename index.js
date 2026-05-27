@@ -5091,6 +5091,14 @@ const prepareAiAgentRequest = async (userId, bookId, messages) => {
     },
   });
 
+  const pendingAudioNotes = await prisma.audioNote.findMany({
+    where: { userId, status: 'pending' },
+    orderBy: { recordedAt: 'asc' }
+  });
+  const audioNotesSummary = pendingAudioNotes.length > 0
+    ? pendingAudioNotes.map(n => `- [${new Date(n.recordedAt).toLocaleTimeString()}] ${n.text || "Unclear audio"}`).join('\n')
+    : 'None';
+
   const userData = await prisma.user.findUnique({ where: { id: userId } });
   const intent = detectAiIntent(messages);
   const lastUserMessage = getLastUserMessage(messages);
@@ -5157,10 +5165,13 @@ RULES:
 - Personal org is not a real organization. Org book outflow is Send only.
 - Never say a transaction is saved; say it is ready for user approval.
 - Use book IDs from USER BOOKS for transaction actions.
+- If the user asks to process pending audio notes, read the PENDING AUDIO NOTES section. For clear notes, create transaction action blocks. For unclear notes, ask the user what they meant.
 
 USER: ${userData?.name || 'User'}
 ACTIVE BOOK: ${activeBookEntry ? `"${activeBookEntry.book.name}" (${activeBookEntry.book.id})` : 'None'}
 PENDING APPROVALS: ${pendingApprovalCount}
+PENDING AUDIO NOTES: 
+${audioNotesSummary}
 ORGS: ${orgSummary}
 BOOKS:
 ${booksSummary || 'None'}
