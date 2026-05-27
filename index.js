@@ -245,6 +245,12 @@ app.get('/api/health', (_req, res) => {
     status: 'ok',
     adminKeySet: !!process.env.ADMIN_KEY,
     adminKeyLength: adminKey.length,
+    storage: {
+      mode: useS3 ? 's3' : 'local',
+      bucket: useS3 ? s3Bucket : null,
+      endpointConfigured: !!s3Endpoint,
+      credentialsConfigured: !!(s3AccessKey && s3SecretKey),
+    },
   });
 });
 
@@ -305,13 +311,21 @@ app.post('/api/upload', authenticateToken, (req, res) => {
     }
 
     let fileUrl = `/uploads/${req.file.filename}`;
+    let storage = useS3 ? 's3' : 'local';
     if (useS3) {
       // Caller can pass ?folder=profile-pictures / org-profile / vouchers etc.
       const requestedFolder = req.query.folder || req.body?.folder || null;
       const storedPath = await uploadToS3(req.file.path, req.file.filename, req.file.mimetype, requestedFolder);
-      if (storedPath) fileUrl = `/uploads/${storedPath}`;
+      if (storedPath) {
+        fileUrl = `/uploads/${storedPath}`;
+      } else {
+        console.error('[Upload] S3 enabled but upload failed; file kept at', req.file.path);
+        return res.status(502).json({
+          error: 'Cloud storage upload failed. Check STORAGE_S3_* settings on the server.',
+        });
+      }
     }
-    res.json({ imageUrl: fileUrl });
+    res.json({ imageUrl: fileUrl, storage });
   });
 });
 
@@ -467,6 +481,23 @@ const userStillActive = async (userId) => {
 
 const pickOrgRepresentative = (adminIds, excludeId) => adminIds.find((id) => id && id !== excludeId) || null;
 
+// Linked modify/delete: require the other party. Orphan when leg/user/org gone (see computeRequiredApprovers).
+// Dual-book same user (e.g. org Send → own personal): still require counterparty-leg confirmation.
+const finalizeLinkedChangeDeleteApprovers = (candidateIds, requesterId, chain) => {
+  let required = [...new Set(candidateIds.filter((id) => id && id !== requesterId))];
+  const dualLegs =
+    chain.p1?.hasEntry &&
+    chain.p2?.hasEntry &&
+    chain.p1?.active &&
+    chain.p2?.active &&
+    chain.p1?.userId &&
+    chain.p1.userId === chain.p2?.userId;
+  if (required.length === 0 && dualLegs) {
+    required = [chain.p2.userId];
+  }
+  return required;
+};
+
 const buildP1OrgApprovers = (chain, requesterId) => {
   const requesterIsP1 = requesterId === chain.p1.userId;
   const requesterIsOrg = chain.org.adminIds.includes(requesterId);
@@ -508,7 +539,7 @@ const computeRequiredApprovers = (chain, requesterId) => {
     }
     const otherId = requesterId === chain.p1.userId ? chain.p2.userId : chain.p1.userId;
     return {
-      requiredApprovers: otherId && otherId !== requesterId ? [otherId] : [],
+      requiredApprovers: finalizeLinkedChangeDeleteApprovers(otherId ? [otherId] : [], requesterId, chain),
       orgApprovalAnyOf: [],
       chainNote: 'dual',
       isOrphan: false,
@@ -529,7 +560,7 @@ const computeRequiredApprovers = (chain, requesterId) => {
       if (p1Ok && p2Ok) {
         const otherId = requesterId === chain.p1.userId ? chain.p2.userId : chain.p1.userId;
         return {
-          requiredApprovers: otherId && otherId !== requesterId ? [otherId] : [],
+          requiredApprovers: finalizeLinkedChangeDeleteApprovers(otherId ? [otherId] : [], requesterId, chain),
           orgApprovalAnyOf: [],
           chainNote: 'degraded_p1_p2',
           isOrphan: false,
@@ -558,7 +589,11 @@ const computeRequiredApprovers = (chain, requesterId) => {
       }
       if (requesterIsOrg) {
         return {
-          requiredApprovers: chain.p2.userId && chain.p2.userId !== requesterId ? [chain.p2.userId] : [],
+          requiredApprovers: finalizeLinkedChangeDeleteApprovers(
+            [chain.p1.userId, chain.p2.userId].filter(Boolean),
+            requesterId,
+            chain
+          ),
           orgApprovalAnyOf: [],
           chainNote: 'degraded_org_p2',
           isOrphan: false,
@@ -595,7 +630,7 @@ const computeRequiredApprovers = (chain, requesterId) => {
     }
 
     return {
-      requiredApprovers: [...new Set(required.filter((id) => id && id !== requesterId))],
+      requiredApprovers: finalizeLinkedChangeDeleteApprovers(required, requesterId, chain),
       orgApprovalAnyOf: chain.org.adminIds,
       chainNote: 'triple',
       isOrphan: false,
@@ -2245,7 +2280,7 @@ app.post('/api/transactions', authenticateToken, async (req, res) => {
         broadcastToUsers(adminIds, { type: "deficit_send", message: { bn: bnMsg, en: enMsg }, transaction: enriched });
       }
 
-      // Notify recipient immediately if org approval was bypassed (skip for already-approved self-sends)
+      // Notify recipient when org approval was bypassed (skip for already-approved self-sends)
       if (bypassOrgApproval && initialStatus !== 'approved') {
         broadcastToUser(recipientUserId, { type: "pending_send_received", transaction: enriched });
       }
@@ -3025,7 +3060,12 @@ app.post('/api/transactions/:id/action', authenticateToken, async (req, res) => 
     if (txn.pendingAction && ['edit', 'delete'].includes(txn.pendingAction)) {
       const pendingDataObj = parsePendingData(txn.pendingData);
       if (pendingDataObj.requestedBy === req.user.id) {
-        return res.status(403).json({ error: 'You cannot approve or reject your own edit/delete request.' });
+        const allowLinkedCounterpartySelfApprove =
+          txn.linkedTransactionId &&
+          (pendingDataObj.requiredApprovers || []).includes(req.user.id);
+        if (!allowLinkedCounterpartySelfApprove) {
+          return res.status(403).json({ error: 'You cannot approve or reject your own edit/delete request.' });
+        }
       }
       const required = pendingDataObj.requiredApprovers || [];
       const orgAnyOf = pendingDataObj.orgApprovalAnyOf || [];
@@ -3288,8 +3328,7 @@ app.post('/api/transactions/:id/action', authenticateToken, async (req, res) => 
 
         const isSend = txn.category === 'Send' && txn.linkedTransactionId;
         if (isSend || (txn.category === 'Send' && (txn.recipientUserId || txn.recipientOrgId))) {
-          const isSelfSend = txn.recipientUserId === txn.createdById;
-          const nextStatus = isSelfSend ? 'approved' : 'pending_recipient';
+          const nextStatus = 'pending_recipient';
 
           // Send: advance fund_send chain (parallel org + recipient) or linked pair
           let fundSendOrgResult = null;
@@ -3342,7 +3381,7 @@ app.post('/api/transactions/:id/action', authenticateToken, async (req, res) => 
           }
 
           // Notify recipient that org approval passed
-          if (txn.recipientUserId && !isSelfSend) {
+          if (txn.recipientUserId) {
             broadcastToUser(txn.recipientUserId, { type: 'pending_send_received', transaction: txn });
           } else if (txn.recipientOrgId) {
             const recipientAdmins = await prisma.organizationMember.findMany({
@@ -3354,7 +3393,7 @@ app.post('/api/transactions/:id/action', authenticateToken, async (req, res) => 
             broadcastToUsers(adminIds, { type: "pending_send_received", transaction: enriched });
           }
           broadcast({ type: "data_changed" });
-          return res.json({ message: isSelfSend ? 'Org approved, transaction completed' : 'Org approved, waiting for recipient acceptance' });
+          return res.json({ message: 'Org approved, waiting for recipient acceptance' });
         } else {
           // Check if it is a book-based voucher
           if (txn.orgFundId) {
