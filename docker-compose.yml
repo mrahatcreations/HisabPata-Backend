@@ -1,0 +1,64 @@
+services:
+  backend:
+    build:
+      context: ./backend
+      args:
+        JWT_SECRET: "${JWT_SECRET}"
+        DATABASE_URL: "${DATABASE_URL}"
+        NODE_ENV: "${NODE_ENV:-production}"
+        ADMIN_KEY: "${ADMIN_KEY}"
+    ports:
+      - "8000:8000"
+    environment:
+      - JWT_SECRET=${JWT_SECRET}
+      - DATABASE_URL=${DATABASE_URL}
+      - NODE_ENV=${NODE_ENV:-production}
+      - PORT=8000
+      - ADMIN_KEY=${ADMIN_KEY}
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        API_BASE_URL: "${API_BASE_URL:-http://backend:8000}"
+        WS_URL: "${WS_URL:-ws://backend:8000}"
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+  admin_console:
+    build:
+      context: ./admin_console
+    ports:
+      - "3001:3001"
+    environment:
+      - ADMIN_API_URL=${ADMIN_API_URL:-http://backend:8000}
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+  db:
+    image: postgres:16-alpine
+    ports:
+      - "5433:5432"
+    environment:
+      POSTGRES_USER: "${POSTGRES_USER:-postgres}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:-postgres}"
+      POSTGRES_DB: "${POSTGRES_DB:-hisabpata}"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-hisabpata}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+volumes:
+  pgdata:
