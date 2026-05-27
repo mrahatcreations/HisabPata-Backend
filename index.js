@@ -283,7 +283,444 @@ const getOrgAdminUserIds = async (orgId) => {
   return admins.map(a => a.userId);
 };
 
+const parsePendingData = (pendingData) => {
+  if (!pendingData) return {};
+  return typeof pendingData === 'string' ? JSON.parse(pendingData) : pendingData;
+};
+
 const CREATOR_PERSONAL_MIRROR_SUFFIX = '_cpm';
+
+const findCreatorPersonalMirror = async (orgTxn, txClient = prisma) => {
+  if (!orgTxn?.clientRef) return null;
+  return txClient.transaction.findFirst({
+    where: { clientRef: orgTxn.clientRef + CREATOR_PERSONAL_MIRROR_SUFFIX }
+  });
+};
+
+// Org book Send expense ↔ personal book Send income
+const resolveOrgDisbursementOrgTxn = async (txn, book) => {
+  let resolvedBook = book;
+  if (!resolvedBook?.organization) {
+    resolvedBook = await prisma.book.findUnique({
+      where: { id: txn.bookId },
+      include: { organization: true }
+    });
+  }
+  if (!resolvedBook) return null;
+
+  if (!resolvedBook.organization?.isPersonal && txn.type === 'expense' && txn.category === 'Send') {
+    return { orgTxn: txn, orgBook: resolvedBook };
+  }
+  if (resolvedBook.organization?.isPersonal && txn.type === 'income' && txn.category === 'Send' && txn.linkedTransactionId) {
+    const linked = await prisma.transaction.findUnique({
+      where: { id: txn.linkedTransactionId },
+      include: { book: { include: { organization: true } } }
+    });
+    if (linked?.type === 'expense' && linked?.category === 'Send' && !linked.book?.organization?.isPersonal) {
+      return { orgTxn: linked, orgBook: linked.book };
+    }
+  }
+  return null;
+};
+
+const userStillActive = async (userId) => {
+  if (!userId) return false;
+  const user = await prisma.user.findUnique({ where: { id: userId }, select: { id: true } });
+  return !!user;
+};
+
+const pickOrgRepresentative = (adminIds, excludeId) => adminIds.find((id) => id && id !== excludeId) || null;
+
+const buildP1OrgApprovers = (chain, requesterId) => {
+  const requesterIsP1 = requesterId === chain.p1.userId;
+  const requesterIsOrg = chain.org.adminIds.includes(requesterId);
+  if (requesterIsP1) {
+    const rep = pickOrgRepresentative(chain.org.adminIds, requesterId);
+    return { requiredApprovers: rep ? [rep] : [], orgApprovalAnyOf: chain.org.adminIds, chainNote: 'degraded_p1_org' };
+  }
+  if (requesterIsOrg) {
+    return {
+      requiredApprovers: chain.p1.userId && chain.p1.userId !== requesterId ? [chain.p1.userId] : [],
+      orgApprovalAnyOf: [],
+      chainNote: 'degraded_p1_org',
+    };
+  }
+  const rep = pickOrgRepresentative(chain.org.adminIds, requesterId);
+  return { requiredApprovers: rep ? [rep] : [], orgApprovalAnyOf: chain.org.adminIds, chainNote: 'degraded_p1_org' };
+};
+
+const computeRequiredApprovers = (chain, requesterId) => {
+  if (!chain || chain.kind === 'solo') {
+    return { requiredApprovers: [], orgApprovalAnyOf: [], chainNote: 'solo', isOrphan: true };
+  }
+
+  if (chain.kind === 'p1_org') {
+    const p1Ok = chain.p1.active && chain.p1.hasEntry;
+    const orgOk = chain.org.active && chain.org.hasEntry;
+    if (!p1Ok || !orgOk) {
+      return { requiredApprovers: [], orgApprovalAnyOf: [], chainNote: 'orphan_dual', isOrphan: true };
+    }
+    const result = buildP1OrgApprovers(chain, requesterId);
+    return { ...result, isOrphan: false };
+  }
+
+  if (chain.kind === 'p1_p2') {
+    const p1Ok = chain.p1.active && chain.p1.hasEntry;
+    const p2Ok = chain.p2.active && chain.p2.hasEntry;
+    if (!p1Ok || !p2Ok) {
+      return { requiredApprovers: [], orgApprovalAnyOf: [], chainNote: 'orphan_dual', isOrphan: true };
+    }
+    const otherId = requesterId === chain.p1.userId ? chain.p2.userId : chain.p1.userId;
+    return {
+      requiredApprovers: otherId && otherId !== requesterId ? [otherId] : [],
+      orgApprovalAnyOf: [],
+      chainNote: 'dual',
+      isOrphan: false,
+    };
+  }
+
+  if (chain.kind === 'p1_org_p2') {
+    const p1Ok = chain.p1.active && chain.p1.hasEntry;
+    const p2Ok = chain.p2.active && chain.p2.hasEntry;
+    const orgOk = chain.org.active && chain.org.hasEntry;
+    const presentLegs = [p1Ok, p2Ok, orgOk].filter(Boolean).length;
+
+    if (presentLegs <= 1) {
+      return { requiredApprovers: [], orgApprovalAnyOf: [], chainNote: 'orphan_triple', isOrphan: true };
+    }
+
+    if (!orgOk) {
+      if (p1Ok && p2Ok) {
+        const otherId = requesterId === chain.p1.userId ? chain.p2.userId : chain.p1.userId;
+        return {
+          requiredApprovers: otherId && otherId !== requesterId ? [otherId] : [],
+          orgApprovalAnyOf: [],
+          chainNote: 'degraded_p1_p2',
+          isOrphan: false,
+        };
+      }
+      return { requiredApprovers: [], orgApprovalAnyOf: [], chainNote: 'orphan_triple', isOrphan: true };
+    }
+
+    if (!p2Ok || !chain.p2.active) {
+      if (!p1Ok) {
+        return { requiredApprovers: [], orgApprovalAnyOf: [], chainNote: 'orphan_triple', isOrphan: true };
+      }
+      const result = buildP1OrgApprovers(chain, requesterId);
+      return { ...result, isOrphan: false };
+    }
+
+    if (!p1Ok || !chain.p1.active) {
+      if (!p2Ok) {
+        return { requiredApprovers: [], orgApprovalAnyOf: [], chainNote: 'orphan_triple', isOrphan: true };
+      }
+      const requesterIsP2 = requesterId === chain.p2.userId;
+      const requesterIsOrg = chain.org.adminIds.includes(requesterId);
+      if (requesterIsP2) {
+        const rep = pickOrgRepresentative(chain.org.adminIds, requesterId);
+        return { requiredApprovers: rep ? [rep] : [], orgApprovalAnyOf: chain.org.adminIds, chainNote: 'degraded_org_p2', isOrphan: false };
+      }
+      if (requesterIsOrg) {
+        return {
+          requiredApprovers: chain.p2.userId && chain.p2.userId !== requesterId ? [chain.p2.userId] : [],
+          orgApprovalAnyOf: [],
+          chainNote: 'degraded_org_p2',
+          isOrphan: false,
+        };
+      }
+      const rep = pickOrgRepresentative(chain.org.adminIds, requesterId);
+      return {
+        requiredApprovers: [chain.p2.userId, rep].filter((id) => id && id !== requesterId),
+        orgApprovalAnyOf: chain.org.adminIds,
+        chainNote: 'degraded_org_p2',
+        isOrphan: false,
+      };
+    }
+
+    const required = [];
+    const requesterIsP1 = requesterId === chain.p1.userId;
+    const requesterIsP2 = requesterId === chain.p2.userId;
+    const requesterIsOrg = chain.org.adminIds.includes(requesterId);
+
+    if (requesterIsP1) {
+      if (chain.p2.userId) required.push(chain.p2.userId);
+      const rep = pickOrgRepresentative(chain.org.adminIds, requesterId);
+      if (rep) required.push(rep);
+    } else if (requesterIsP2) {
+      if (chain.p1.userId) required.push(chain.p1.userId);
+      const rep = pickOrgRepresentative(chain.org.adminIds, requesterId);
+      if (rep) required.push(rep);
+    } else if (requesterIsOrg) {
+      if (chain.p1.userId) required.push(chain.p1.userId);
+      if (chain.p2.userId) required.push(chain.p2.userId);
+    } else {
+      if (chain.p1.userId) required.push(chain.p1.userId);
+      if (chain.p2.userId) required.push(chain.p2.userId);
+    }
+
+    return {
+      requiredApprovers: [...new Set(required.filter((id) => id && id !== requesterId))],
+      orgApprovalAnyOf: chain.org.adminIds,
+      chainNote: 'triple',
+      isOrphan: false,
+    };
+  }
+
+  return { requiredApprovers: [], orgApprovalAnyOf: [], chainNote: 'solo', isOrphan: true };
+};
+
+const resolveChangeDeleteChain = async (txn, book) => {
+  let resolvedBook = book;
+  if (!resolvedBook?.organization) {
+    resolvedBook = await prisma.book.findUnique({
+      where: { id: txn.bookId },
+      include: { organization: true },
+    });
+  }
+  if (!resolvedBook) return { kind: 'solo' };
+
+  const disbursement = await resolveOrgDisbursementOrgTxn(txn, resolvedBook);
+  if (disbursement) {
+    const { orgTxn, orgBook } = disbursement;
+    const org = orgBook?.organizationId
+      ? await prisma.organization.findUnique({ where: { id: orgBook.organizationId } })
+      : null;
+    const orgAdminIds = org ? await getOrgAdminUserIds(orgBook.organizationId) : [];
+    const personalTxn = orgTxn.linkedTransactionId
+      ? await prisma.transaction.findUnique({ where: { id: orgTxn.linkedTransactionId } })
+      : null;
+
+    return {
+      kind: 'p1_org_p2',
+      p1: {
+        userId: orgTxn.createdById,
+        active: await userStillActive(orgTxn.createdById),
+        hasEntry: !!orgTxn?.id,
+      },
+      p2: {
+        userId: orgTxn.recipientUserId,
+        active: await userStillActive(orgTxn.recipientUserId),
+        hasEntry: !!personalTxn?.id,
+      },
+      org: {
+        active: !!org,
+        hasEntry: !!orgTxn?.id && !!org,
+        adminIds: orgAdminIds,
+      },
+    };
+  }
+
+  let personalEntry = null;
+  let orgEntry = null;
+  let p1UserId = txn.createdById;
+
+  if (resolvedBook.organization?.isPersonal && (txn.orgFundId || txn.clientRef)) {
+    personalEntry = txn;
+    if (txn.clientRef?.endsWith(CREATOR_PERSONAL_MIRROR_SUFFIX)) {
+      const baseRef = txn.clientRef.slice(0, -CREATOR_PERSONAL_MIRROR_SUFFIX.length);
+      orgEntry = await prisma.transaction.findFirst({ where: { clientRef: baseRef } });
+    } else {
+      orgEntry = await prisma.transaction.findFirst({
+        where: {
+          bookId: txn.orgFundId || undefined,
+          clientRef: txn.clientRef || undefined,
+          amount: txn.amount,
+          createdById: txn.createdById,
+        },
+      });
+    }
+  } else if (!resolvedBook.organization?.isPersonal) {
+    orgEntry = txn;
+    personalEntry = await findCreatorPersonalMirror(txn);
+    if (!personalEntry && txn.orgFundId) {
+      personalEntry = await prisma.transaction.findFirst({
+        where: { orgFundId: txn.orgFundId, amount: txn.amount, createdById: txn.createdById },
+      });
+    }
+  }
+
+  if (personalEntry || orgEntry) {
+    const orgBookId = orgEntry?.bookId || txn.orgFundId || resolvedBook.id;
+    const orgBook = orgBookId
+      ? await prisma.book.findUnique({ where: { id: orgBookId }, include: { organization: true } })
+      : null;
+    const org = orgBook?.organizationId
+      ? await prisma.organization.findUnique({ where: { id: orgBook.organizationId } })
+      : null;
+    const orgAdminIds = org ? await getOrgAdminUserIds(orgBook.organizationId) : [];
+
+    return {
+      kind: 'p1_org',
+      p1: {
+        userId: p1UserId,
+        active: await userStillActive(p1UserId),
+        hasEntry: !!personalEntry?.id,
+      },
+      org: {
+        active: !!org,
+        hasEntry: !!orgEntry?.id && !!org,
+        adminIds: orgAdminIds,
+      },
+    };
+  }
+
+  const linked = txn.linkedTransactionId
+    ? await prisma.transaction.findUnique({ where: { id: txn.linkedTransactionId } })
+    : null;
+  const partyA = txn.createdById;
+  const partyB = txn.recipientUserId || linked?.recipientUserId || linked?.createdById;
+
+  if (linked || txn.recipientUserId) {
+    return {
+      kind: 'p1_p2',
+      p1: { userId: partyA, active: await userStillActive(partyA), hasEntry: !!txn?.id },
+      p2: { userId: partyB, active: await userStillActive(partyB), hasEntry: !!linked?.id },
+    };
+  }
+
+  return { kind: 'solo' };
+};
+
+const getLinkedPartyUserIds = async (txn, book) => {
+  const chain = await resolveChangeDeleteChain(txn, book);
+  if (chain.kind === 'p1_org_p2') {
+    return [...new Set([chain.p1.userId, chain.p2.userId, ...chain.org.adminIds].filter(Boolean))];
+  }
+  if (chain.kind === 'p1_org') {
+    return [...new Set([chain.p1.userId, ...chain.org.adminIds].filter(Boolean))];
+  }
+  if (chain.kind === 'p1_p2') {
+    return [...new Set([chain.p1.userId, chain.p2.userId].filter(Boolean))];
+  }
+  return txn.createdById ? [txn.createdById] : [];
+};
+
+const getRequiredApproversForChangeDelete = async (txn, book, requesterId) => {
+  const chain = await resolveChangeDeleteChain(txn, book);
+  return computeRequiredApprovers(chain, requesterId).requiredApprovers;
+};
+
+const isChangeDeleteFullyApproved = (pendingData) => {
+  const pd = parsePendingData(pendingData);
+  const required = pd.requiredApprovers || [];
+  const orgAnyOf = pd.orgApprovalAnyOf || [];
+  const approvals = pd.approvals || [];
+  if (required.length === 0) return true;
+
+  const nonOrgRequired = required.filter((id) => !orgAnyOf.includes(id));
+  const orgRequired = required.some((id) => orgAnyOf.includes(id));
+  const peopleOk = nonOrgRequired.every((id) => approvals.includes(id));
+  const orgOk = !orgRequired || orgAnyOf.some((id) => approvals.includes(id));
+  return peopleOk && orgOk;
+};
+
+const recordChangeDeleteApproval = (pendingData, approverId) => {
+  const pd = parsePendingData(pendingData);
+  const approvals = [...(pd.approvals || [])];
+  if (!approvals.includes(approverId)) approvals.push(approverId);
+  return { ...pd, approvals };
+};
+
+const buildChangeDeletePendingData = async (txn, book, requesterId, baseData = {}) => {
+  const chain = await resolveChangeDeleteChain(txn, book);
+  const { requiredApprovers, orgApprovalAnyOf, chainNote, isOrphan } = computeRequiredApprovers(chain, requesterId);
+  const partyIds = await getLinkedPartyUserIds(txn, book);
+  const requester = await prisma.user.findUnique({ where: { id: requesterId }, select: { name: true } });
+  return {
+    ...baseData,
+    requestedBy: requesterId,
+    requesterName: requester?.name || 'Unknown',
+    requiredApprovers,
+    orgApprovalAnyOf,
+    approvals: [],
+    partyCount: partyIds.length,
+    requiredApprovalCount: requiredApprovers.length,
+    chainNote,
+    isOrphan: !!isOrphan,
+  };
+};
+
+const buildChangeDeleteNotification = (pendingData, pendingAction, txn) => {
+  const pd = parsePendingData(pendingData);
+  const requester = pd.requesterName || 'Someone';
+  const required = pd.requiredApprovalCount ?? (pd.requiredApprovers || []).length;
+  const approved = (pd.approvals || []).length;
+  const progress = required > 0 ? `${approved}/${required}` : null;
+
+  if (pendingAction === 'delete') {
+    const amount = pd.oldAmount ?? txn?.amount;
+    const note = pd.oldNote ?? txn?.note ?? '';
+    if (pd.isOrphan || required === 0) {
+      return {
+        bn: `${requester} ৳${amount} লেনদেন মুছতে চাচ্ছেন${note ? ` (“${note}”)` : ''}। বিপরীত পক্ষ/এন্ট্রি নেই — অনুমোদন লাগবে না।`,
+        en: `${requester} wants to delete ৳${amount}${note ? ` ("${note}")` : ''}. Counterparty entry missing — no approval needed.`,
+        shortBn: `মুছে ফেলা (অরফান): ৳${amount}${note ? ` — ${note}` : ''}`,
+        shortEn: `Delete (orphan): ৳${amount}${note ? ` — ${note}` : ''}`,
+        progress: null,
+      };
+    }
+    return {
+      bn: `${requester} ৳${amount} লেনদেন মুছতে চাচ্ছেন${note ? ` (“${note}”)` : ''}। ${required} জনের অনুমোদন লাগবে${progress ? ` (${progress})` : ''}।`,
+      en: `${requester} wants to delete ৳${amount}${note ? ` ("${note}")` : ''}. Needs ${required} approval(s)${progress ? ` (${progress})` : ''}.`,
+      shortBn: `মুছে ফেলা: ৳${amount}${note ? ` — ${note}` : ''}`,
+      shortEn: `Delete: ৳${amount}${note ? ` — ${note}` : ''}`,
+      progress,
+    };
+  }
+
+  const oldAmount = pd.oldAmount ?? txn?.amount;
+  const newAmount = pd.newAmount ?? txn?.amount;
+  const oldNote = pd.oldNote ?? txn?.note ?? '';
+  const newNote = pd.newNote ?? txn?.note ?? '';
+  const changes = [];
+  if (oldAmount != null && newAmount != null && oldAmount !== newAmount) {
+    changes.push(`৳${oldAmount} → ৳${newAmount}`);
+  }
+  if (oldNote !== newNote) {
+    changes.push(`“${oldNote || '—'}” → “${newNote || '—'}”`);
+  }
+  const changeText = changes.length > 0 ? changes.join(', ') : 'details updated';
+  if (pd.isOrphan || required === 0) {
+    return {
+      bn: `${requester} লেনদেন সম্পাদন করতে চাচ্ছেন: ${changeText}। বিপরীত পক্ষ/এন্ট্রি নেই — অনুমোদন লাগবে না।`,
+      en: `${requester} wants to edit: ${changeText}. Counterparty entry missing — no approval needed.`,
+      shortBn: `সম্পাদনা (অরফান): ${changeText}`,
+      shortEn: `Edit (orphan): ${changeText}`,
+      progress: null,
+      oldAmount,
+      newAmount,
+      oldNote,
+      newNote,
+    };
+  }
+  return {
+    bn: `${requester} লেনদেন সম্পাদন করতে চাচ্ছেন: ${changeText}। ${required} জনের অনুমোদন লাগবে${progress ? ` (${progress})` : ''}।`,
+    en: `${requester} wants to edit: ${changeText}. Needs ${required} approval(s)${progress ? ` (${progress})` : ''}.`,
+    shortBn: `সম্পাদনা: ${changeText}`,
+    shortEn: `Edit: ${changeText}`,
+    progress,
+    oldAmount,
+    newAmount,
+    oldNote,
+    newNote,
+  };
+};
+
+const notifyChangeDeleteApprovers = async (txn, pendingAction, pendingData) => {
+  const pd = parsePendingData(pendingData);
+  const approverIds = new Set([
+    ...(pd.requiredApprovers || []).filter((id) => !(pd.approvals || []).includes(id)),
+    ...(pd.orgApprovalAnyOf || []).filter((id) => !(pd.approvals || []).includes(id)),
+  ]);
+  if (approverIds.size === 0) return;
+  const summary = buildChangeDeleteNotification(pendingData, pendingAction, txn);
+  broadcastToUsers([...approverIds], {
+    type: 'change_delete_request',
+    pendingAction,
+    transactionId: txn.id,
+    message: summary,
+  });
+};
 
 const getUserPersonalBook = async (userId, txClient = prisma) => {
   const membership = await txClient.organizationMember.findFirst({
@@ -291,13 +728,6 @@ const getUserPersonalBook = async (userId, txClient = prisma) => {
     include: { organization: { include: { books: { where: { isDefault: true }, take: 1 } } } }
   });
   return membership?.organization?.books?.[0] || null;
-};
-
-const findCreatorPersonalMirror = async (orgTxn, txClient = prisma) => {
-  if (!orgTxn?.clientRef) return null;
-  return txClient.transaction.findFirst({
-    where: { clientRef: orgTxn.clientRef + CREATOR_PERSONAL_MIRROR_SUFFIX }
-  });
 };
 
 const createCreatorPersonalMirror = async (tx, {
@@ -915,6 +1345,98 @@ app.post('/api/auth/change-password', authenticateToken, async (req, res) => {
   } catch (error) {
     console.error('Change password error:', error);
     res.status(500).json({ error: 'Server error changing password' });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// USER AI CONFIG — per-account cloud storage for AI agent
+// ─────────────────────────────────────────────────────────────────────────────
+const AI_CONFIG_PROVIDERS = new Set(['gemini', 'openai', 'claude']);
+
+function normalizeAiConfigPayload(body = {}) {
+  const provider = typeof body.provider === 'string' ? body.provider.trim().toLowerCase() : '';
+  const apiKey = typeof body.apiKey === 'string' ? body.apiKey.trim() : '';
+  const selectedModel = typeof body.selectedModel === 'string' ? body.selectedModel.trim() : '';
+  const workingModels = Array.isArray(body.workingModels)
+    ? body.workingModels.map((m) => String(m).trim()).filter(Boolean)
+    : [];
+  const baseUrl = typeof body.baseUrl === 'string' ? body.baseUrl.trim() : '';
+  const temperature = body.temperature != null ? parseFloat(body.temperature) : 0.7;
+  const maxTokens = body.maxTokens != null ? parseInt(body.maxTokens, 10) : 2048;
+
+  if (!AI_CONFIG_PROVIDERS.has(provider)) {
+    return { error: 'Invalid provider. Use gemini, openai, or claude.' };
+  }
+  if (!apiKey) {
+    return { error: 'API key is required' };
+  }
+  if (!selectedModel && workingModels.length === 0) {
+    return { error: 'At least one model must be configured' };
+  }
+
+  return {
+    config: {
+      provider,
+      apiKey,
+      selectedModel: selectedModel || workingModels[0],
+      workingModels,
+      baseUrl,
+      temperature: Number.isFinite(temperature) ? temperature : 0.7,
+      maxTokens: Number.isFinite(maxTokens) ? maxTokens : 512,
+      updatedAt: new Date().toISOString(),
+    },
+  };
+}
+
+async function loadUserAiConfig(userId) {
+  const user = await prisma.user.findUnique({
+    where: { id: userId },
+    select: { aiConfig: true },
+  });
+  return user?.aiConfig || null;
+}
+
+function resolveAiRequestConfig(body, storedConfig) {
+  const cfg = storedConfig && typeof storedConfig === 'object' ? storedConfig : {};
+  return {
+    provider: body.provider || cfg.provider,
+    apiKey: body.apiKey || cfg.apiKey,
+    model: body.model || cfg.selectedModel,
+    baseUrl: body.baseUrl || cfg.baseUrl || null,
+    temperature: body.temperature != null ? parseFloat(body.temperature) : cfg.temperature,
+    maxTokens: body.maxTokens != null ? parseInt(body.maxTokens, 10) : cfg.maxTokens,
+  };
+}
+
+app.get('/api/user/ai-config', authenticateToken, async (req, res) => {
+  try {
+    const cfg = await loadUserAiConfig(req.user.id);
+    if (!cfg || !cfg.apiKey) {
+      return res.json({ configured: false, config: null });
+    }
+    return res.json({ configured: true, config: cfg });
+  } catch (error) {
+    console.error('[AI Config] Fetch error:', error);
+    res.status(500).json({ error: 'Server error fetching AI configuration' });
+  }
+});
+
+app.put('/api/user/ai-config', authenticateToken, async (req, res) => {
+  try {
+    const normalized = normalizeAiConfigPayload(req.body);
+    if (normalized.error) {
+      return res.status(400).json({ error: normalized.error });
+    }
+
+    await prisma.user.update({
+      where: { id: req.user.id },
+      data: { aiConfig: normalized.config },
+    });
+
+    res.json({ message: 'AI configuration saved', config: normalized.config });
+  } catch (error) {
+    console.error('[AI Config] Save error:', error);
+    res.status(500).json({ error: 'Server error saving AI configuration' });
   }
 });
 
@@ -1598,7 +2120,7 @@ app.post('/api/transactions', authenticateToken, async (req, res) => {
           data: { bookId, amount: parsedAmount, type: 'expense', note: sourceNote, category: 'Send', contact, recipientUserId, createdById: req.user.id, reconStatus: initialStatus, imageUrl, chainId, chainType, orgFundId, clientRef: txnClientRef }
         });
         const recipientTxn = await prisma.transaction.create({
-          data: { bookId: recipientBook.id, amount: parsedAmount, type: 'income', note: 'Org fund advance: ' + (note || ''), category: 'Send', contact, recipientUserId: req.user.id, linkedTransactionId: null, createdById: req.user.id, reconStatus: initialStatus, chainId, chainType }
+          data: { bookId: recipientBook.id, amount: parsedAmount, type: 'income', note: note || '', category: 'Send', contact, recipientUserId: req.user.id, linkedTransactionId: null, createdById: req.user.id, reconStatus: initialStatus, chainId, chainType }
         });
         await prisma.book.update({ where: { id: bookId }, data: { balance: { decrement: parsedAmount } } });
         await prisma.book.update({ where: { id: recipientBook.id }, data: { balance: { increment: parsedAmount } } });
@@ -1867,11 +2389,15 @@ app.put('/api/transactions/:id', authenticateToken, async (req, res) => {
     }
 
     const user = await prisma.user.findUnique({ where: { id: req.user.id }, select: { name: true } });
+    const requiredApprovers = txn.reconStatus === 'approved'
+      ? await getRequiredApproversForChangeDelete(txn, book, req.user.id)
+      : [];
+    const needsLinkedApproval = requiredApprovers.length > 0;
 
-    // Personal org — edit directly, no pending/approval flow needed
+    // Personal org — edit directly when no linked-party approval is required
     const editOrg = await prisma.organization.findUnique({ where: { id: book.organizationId }, select: { isPersonal: true } });
     const isManualIncome = txn.type === 'income' && !txn.linkedTransactionId;
-    if (editOrg?.isPersonal || isManualIncome) {
+    if ((editOrg?.isPersonal || isManualIncome) && (txn.reconStatus !== 'approved' || !needsLinkedApproval)) {
       // Personal book or manual income: direct update; skip balance adj on rejected (reject already restored)
       let personalBalAdj = 0;
       if (
@@ -1907,40 +2433,33 @@ app.put('/api/transactions/:id', authenticateToken, async (req, res) => {
           }
         }
 
-        // Handle linked transaction for self-send / own-org-send (auto-approve)
-        if (txn.linkedTransactionId) {
-          const isSelfSend = txn.recipientUserId === req.user.id;
-          let isOwnOrgSend = false;
-          if (txn.recipientOrgId) {
-            isOwnOrgSend = await checkApprovalBypass(txn.recipientOrgId, req.user.id);
-          }
-          if (isSelfSend || isOwnOrgSend) {
-            const linkedTxn = await prisma.transaction.findUnique({ where: { id: txn.linkedTransactionId } });
-            if (linkedTxn) {
-              const linkedChanges = {};
-              if (changes.amount !== undefined) linkedChanges.amount = parsedAmount;
-              if (changes.note !== undefined) linkedChanges.note = changes.note;
-              if (Object.keys(linkedChanges).length > 0) {
-                let linkedBalAdj = 0;
-                if (changes.amount !== undefined && changes.amount !== linkedTxn.amount) {
-                  if (linkedTxn.type === 'income') linkedBalAdj = parsedAmount - linkedTxn.amount;
-                  else if (linkedTxn.type === 'expense') linkedBalAdj = linkedTxn.amount - parsedAmount;
-                }
-                await prisma.transaction.update({
-                  where: { id: txn.linkedTransactionId },
-                  data: {
-                    ...linkedChanges,
-                    updateHistory: [
-                      ...(linkedTxn.updateHistory || []),
-                      { timestamp: new Date().toISOString(), userId: req.user.id, userName: user?.name || 'Unknown', action: 'edit (linked)', changes: { old: { amount: linkedTxn.amount, note: linkedTxn.note }, new: linkedChanges } },
-                    ],
-                  },
-                });
-                if (linkedBalAdj !== 0) {
-                  const linkedBook = await prisma.book.findUnique({ where: { id: linkedTxn.bookId } });
-                  if (linkedBook) {
-                    await prisma.book.update({ where: { id: linkedTxn.bookId }, data: { balance: { increment: linkedBalAdj } } });
-                  }
+        // Sync linked transaction on direct edit when no multi-party approval is needed
+        if (txn.linkedTransactionId && !needsLinkedApproval) {
+          const linkedTxn = await prisma.transaction.findUnique({ where: { id: txn.linkedTransactionId } });
+          if (linkedTxn) {
+            const linkedChanges = {};
+            if (changes.amount !== undefined) linkedChanges.amount = parsedAmount;
+            if (changes.note !== undefined) linkedChanges.note = changes.note;
+            if (Object.keys(linkedChanges).length > 0) {
+              let linkedBalAdj = 0;
+              if (changes.amount !== undefined && changes.amount !== linkedTxn.amount) {
+                if (linkedTxn.type === 'income') linkedBalAdj = parsedAmount - linkedTxn.amount;
+                else if (linkedTxn.type === 'expense') linkedBalAdj = linkedTxn.amount - parsedAmount;
+              }
+              await prisma.transaction.update({
+                where: { id: txn.linkedTransactionId },
+                data: {
+                  ...linkedChanges,
+                  updateHistory: [
+                    ...(linkedTxn.updateHistory || []),
+                    { timestamp: new Date().toISOString(), userId: req.user.id, userName: user?.name || 'Unknown', action: 'edit (linked)', changes: { old: { amount: linkedTxn.amount, note: linkedTxn.note }, new: linkedChanges } },
+                  ],
+                },
+              });
+              if (linkedBalAdj !== 0) {
+                const linkedBook = await prisma.book.findUnique({ where: { id: linkedTxn.bookId } });
+                if (linkedBook) {
+                  await prisma.book.update({ where: { id: linkedTxn.bookId }, data: { balance: { increment: linkedBalAdj } } });
                 }
               }
             }
@@ -1953,13 +2472,7 @@ app.put('/api/transactions/:id', authenticateToken, async (req, res) => {
       const enrichedPersonal = await enrichTxn(personalUpdated);
       return res.json({ transaction: enrichedPersonal, message: 'Transaction updated' });
     } else if (txn.reconStatus === 'approved') {
-      // ── Auto-approve for self-send / own-org-send (skip pending) ──
-      const isSelfSend = txn.recipientUserId === req.user.id;
-      let isOwnOrgSend = false;
-      if (txn.recipientOrgId) {
-        isOwnOrgSend = await checkApprovalBypass(txn.recipientOrgId, req.user.id);
-      }
-      if (isSelfSend || isOwnOrgSend) {
+      if (!needsLinkedApproval) {
         let balanceAdjustment = 0;
         if (changes.amount !== undefined && changes.amount !== txn.amount) {
           if (txn.type === 'expense') balanceAdjustment = txn.amount - parsedAmount;
@@ -1985,7 +2498,6 @@ app.put('/api/transactions/:id', authenticateToken, async (req, res) => {
           if (balanceAdjustment !== 0) {
             await prisma.book.update({ where: { id: book.id }, data: { balance: { increment: balanceAdjustment } } });
           }
-          // Handle linked transaction
           if (txn.linkedTransactionId) {
             const linkedTxn = await prisma.transaction.findUnique({ where: { id: txn.linkedTransactionId } });
             if (linkedTxn) {
@@ -2014,7 +2526,6 @@ app.put('/api/transactions/:id', authenticateToken, async (req, res) => {
               }
             }
           }
-          // Sync to sub-book parent mirror transaction if it exists
           const mirror = await findMirrorTxn(txn, book);
           if (mirror) {
             const mirrorChanges = {};
@@ -2031,7 +2542,7 @@ app.put('/api/transactions/:id', authenticateToken, async (req, res) => {
           }
           return updatedTxn;
         });
-        broadcast({ type: "data_changed" });
+        broadcast({ type: 'data_changed' });
         const enriched = await enrichTxn(updated);
         return res.json({ transaction: enriched, message: 'Transaction updated' });
       }
@@ -2045,14 +2556,16 @@ app.put('/api/transactions/:id', authenticateToken, async (req, res) => {
       }
 
       // Store old data for potential revert
-      const pendingData = {
+      const pendingData = await buildChangeDeletePendingData(txn, book, req.user.id, {
         oldAmount: txn.amount,
         oldType: txn.type,
         oldCategory: txn.category,
         oldNote: txn.note,
         oldRecipientUserId: txn.recipientUserId,
-        requestedBy: req.user.id,
-      };
+        newAmount: changes.amount !== undefined ? parsedAmount : txn.amount,
+        newNote: changes.note !== undefined ? changes.note : txn.note,
+        newCategory: changes.category !== undefined ? changes.category : txn.category,
+      });
 
       // Update transaction: apply changes, set to pending
       const updated = await prisma.$transaction(async (prisma) => {
@@ -2103,13 +2616,7 @@ app.put('/api/transactions/:id', authenticateToken, async (req, res) => {
                 ...linkedChanges,
                 reconStatus: 'pending',
                 pendingAction: 'edit',
-                pendingData: {
-                  oldAmount: linkedTxn.amount,
-                  oldType: linkedTxn.type,
-                  oldCategory: linkedTxn.category,
-                  oldNote: linkedTxn.note,
-                  requestedBy: req.user.id,
-                },
+                pendingData,
                 updateHistory: [
                   ...(linkedTxn.updateHistory || []),
                   {
@@ -2174,9 +2681,15 @@ app.put('/api/transactions/:id', authenticateToken, async (req, res) => {
         return updatedTxn;
       });
 
-      broadcast({ type: "data_changed" });
+      broadcast({ type: 'data_changed' });
+      await notifyChangeDeleteApprovers(updated, 'edit', pendingData);
       const enriched = await enrichTxn(updated);
-      return res.json({ transaction: enriched, message: 'Edit submitted for approval' });
+      const summary = buildChangeDeleteNotification(pendingData, 'edit', updated);
+      return res.json({
+        transaction: enriched,
+        message: 'Edit submitted for approval',
+        notification: summary,
+      });
     } else {
       // Not approved — update directly with no approval needed
       // Balance may need adjustment if amount changed
@@ -2384,6 +2897,8 @@ app.get('/api/transactions/:id/delete-info', authenticateToken, async (req, res)
       counterpartyType: null,
       counterpartyName: null,
       needsApproval: false,
+      requiredApproverCount: 0,
+      canInstantDelete: true,
     };
 
     // Check linkedTransactionId (paired income/expense)
@@ -2443,9 +2958,15 @@ app.get('/api/transactions/:id/delete-info', authenticateToken, async (req, res)
           result.counterpartyExists = true;
           result.counterpartyType = 'user';
           result.counterpartyName = recipientUser.name;
-          result.needsApproval = txn.reconStatus === 'approved';
         }
       }
+    }
+
+    if (txn.reconStatus === 'approved') {
+      const requiredApprovers = await getRequiredApproversForChangeDelete(txn, book, req.user.id);
+      result.requiredApproverCount = requiredApprovers.length;
+      result.needsApproval = requiredApprovers.length > 0;
+      result.canInstantDelete = requiredApprovers.length === 0;
     }
 
     return res.json(result);
@@ -2472,18 +2993,17 @@ app.delete('/api/transactions/:id', authenticateToken, async (req, res) => {
     }
 
     const user = await prisma.user.findUnique({ where: { id: req.user.id }, select: { name: true } });
-
-    // C3: Personal org or manual income — hard-delete immediately, no pending flow
     const org = await prisma.organization.findUnique({ where: { id: book.organizationId }, select: { isPersonal: true } });
     const isManualIncome = txn.type === 'income' && !txn.linkedTransactionId;
-    if (org?.isPersonal || isManualIncome) {
+    const requiredApprovers = txn.reconStatus === 'approved'
+      ? await getRequiredApproversForChangeDelete(txn, book, req.user.id)
+      : [];
+
+    const executeHardDelete = async () => {
       await prisma.$transaction(async (prisma) => {
         let balanceAdjustment = 0;
-        if (txn.type === 'expense') {
-          balanceAdjustment = txn.amount;
-        } else if (txn.type === 'income') {
-          balanceAdjustment = -txn.amount;
-        }
+        if (txn.type === 'expense') balanceAdjustment = txn.amount;
+        else if (txn.type === 'income') balanceAdjustment = -txn.amount;
         if (balanceAdjustment !== 0) {
           await prisma.book.update({ where: { id: book.id }, data: { balance: { increment: balanceAdjustment } } });
         }
@@ -2502,65 +3022,24 @@ app.delete('/api/transactions/:id', authenticateToken, async (req, res) => {
             await prisma.transaction.delete({ where: { id: linked.id } });
           }
         }
-
-        // Sub-book parent mirror transaction sync delete
         const mirror = await findMirrorTxn(txn, book);
         if (mirror) {
           let mirrorAdj = mirror.type === 'income' ? -mirror.amount : mirror.amount;
           await prisma.book.update({ where: { id: book.parentBookId }, data: { balance: { increment: mirrorAdj } } });
           await prisma.transaction.delete({ where: { id: mirror.id } });
         }
-
         await prisma.transaction.delete({ where: { id: txnId } });
       });
-      broadcast({ type: "data_changed" });
+      broadcast({ type: 'data_changed' });
+    };
+
+    // Manual personal income or no linked parties — delete immediately
+    if (isManualIncome || (txn.reconStatus === 'approved' && requiredApprovers.length === 0)) {
+      await executeHardDelete();
       return res.json({ message: 'Transaction deleted' });
     }
 
     if (txn.reconStatus === 'approved') {
-      // ── Auto-approve for self-send / own-org-send (skip pending) ──
-      const isSelfSend = txn.recipientUserId === req.user.id;
-      let isOwnOrgSend = false;
-      if (txn.recipientOrgId) {
-        isOwnOrgSend = await checkApprovalBypass(txn.recipientOrgId, req.user.id);
-      }
-      if (isSelfSend || isOwnOrgSend) {
-        await prisma.$transaction(async (prisma) => {
-          let balanceAdjustment = 0;
-          if (txn.type === 'expense') balanceAdjustment = txn.amount;
-          else if (txn.type === 'income') balanceAdjustment = -txn.amount;
-          if (balanceAdjustment !== 0) {
-            await prisma.book.update({ where: { id: book.id }, data: { balance: { increment: balanceAdjustment } } });
-          }
-          if (txn.linkedTransactionId) {
-            const linked = await prisma.transaction.findUnique({ where: { id: txn.linkedTransactionId } });
-            if (linked) {
-              const linkedBook = await prisma.book.findUnique({ where: { id: linked.bookId } });
-              if (linkedBook) {
-                let linkedAdj = 0;
-                if (linked.type === 'income') linkedAdj = -linked.amount;
-                else if (linked.type === 'expense') linkedAdj = linked.amount;
-                if (linkedAdj !== 0) {
-                  await prisma.book.update({ where: { id: linked.bookId }, data: { balance: { increment: linkedAdj } } });
-                }
-              }
-              await prisma.transaction.delete({ where: { id: linked.id } });
-            }
-          }
-          // Sync to sub-book parent mirror transaction
-          const mirror = await findMirrorTxn(txn, book);
-          if (mirror) {
-            let mirrorAdj = mirror.type === 'income' ? -mirror.amount : mirror.amount;
-            await prisma.book.update({ where: { id: book.parentBookId }, data: { balance: { increment: mirrorAdj } } });
-            await prisma.transaction.delete({ where: { id: mirror.id } });
-          }
-          await prisma.transaction.delete({ where: { id: txnId } });
-        });
-        broadcast({ type: "data_changed" });
-        return res.json({ message: 'Transaction deleted' });
-      }
-
-      // Reverse balance
       let reversedBalance = book.balance;
       if (txn.type === 'expense') {
         reversedBalance += txn.amount;
@@ -2568,7 +3047,7 @@ app.delete('/api/transactions/:id', authenticateToken, async (req, res) => {
         reversedBalance -= txn.amount;
       }
 
-      const pendingData = {
+      const pendingData = await buildChangeDeletePendingData(txn, book, req.user.id, {
         oldAmount: txn.amount,
         oldType: txn.type,
         oldCategory: txn.category,
@@ -2576,8 +3055,7 @@ app.delete('/api/transactions/:id', authenticateToken, async (req, res) => {
         oldRecipientUserId: txn.recipientUserId,
         oldLinkedTransactionId: txn.linkedTransactionId,
         oldOrgFundId: txn.orgFundId,
-        requestedBy: req.user.id,
-      };
+      });
 
       await prisma.$transaction(async (prisma) => {
         await prisma.transaction.update({
@@ -2627,13 +3105,7 @@ app.delete('/api/transactions/:id', authenticateToken, async (req, res) => {
               data: {
                 reconStatus: 'pending',
                 pendingAction: 'delete',
-                pendingData: {
-                  oldAmount: linkedTxn.amount,
-                  oldType: linkedTxn.type,
-                  oldCategory: linkedTxn.category,
-                  oldNote: linkedTxn.note,
-                  requestedBy: req.user.id,
-                },
+                pendingData,
                 updateHistory: [
                   ...(linkedTxn.updateHistory || []),
                   {
@@ -2687,63 +3159,13 @@ app.delete('/api/transactions/:id', authenticateToken, async (req, res) => {
         }
       });
 
-      broadcast({ type: "data_changed" });
-      return res.json({ message: 'Delete request submitted for approval' });
+      broadcast({ type: 'data_changed' });
+      const refreshedTxn = await prisma.transaction.findUnique({ where: { id: txnId } });
+      await notifyChangeDeleteApprovers(refreshedTxn || txn, 'delete', pendingData);
+      const summary = buildChangeDeleteNotification(pendingData, 'delete', refreshedTxn || txn);
+      return res.json({ message: 'Delete request submitted for approval', notification: summary });
     } else {
-      // Not approved — hard delete and reverse any balance effect
-      await prisma.$transaction(async (prisma) => {
-        // Reverse balance if needed
-        let balanceAdjustment = 0;
-        if (txn.type === 'expense') {
-          balanceAdjustment = txn.amount; // add back
-        } else if (txn.type === 'income') {
-          balanceAdjustment = -txn.amount; // subtract
-        }
-        if (balanceAdjustment !== 0) {
-          await prisma.book.update({
-            where: { id: book.id },
-            data: { balance: { increment: balanceAdjustment } },
-          });
-        }
-
-        await prisma.transaction.delete({ where: { id: txnId } });
-
-        // Also delete linked transaction if exists
-        if (txn.linkedTransactionId) {
-          const linkedTxn = await prisma.transaction.findUnique({ where: { id: txn.linkedTransactionId } });
-          if (linkedTxn) {
-            const linkedBook = await prisma.book.findUnique({ where: { id: linkedTxn.bookId } });
-            if (linkedBook) {
-              let linkedAdj = 0;
-              if (linkedTxn.type === 'income') {
-                linkedAdj = -linkedTxn.amount;
-              } else if (linkedTxn.type === 'expense') {
-                linkedAdj = linkedTxn.amount;
-              }
-              if (linkedAdj !== 0) {
-                await prisma.book.update({
-                  where: { id: linkedTxn.bookId },
-                  data: { balance: { increment: linkedAdj } },
-                });
-              }
-            }
-            await prisma.transaction.delete({ where: { id: linkedTxn.id } });
-          }
-        }
-
-        // Sub-book parent mirror transaction sync delete
-        const mirror = await findMirrorTxn(txn, book);
-        if (mirror) {
-          let mirrorAdj = mirror.type === 'income' ? -mirror.amount : mirror.amount;
-          await prisma.book.update({
-            where: { id: book.parentBookId },
-            data: { balance: { increment: mirrorAdj } }
-          });
-          await prisma.transaction.delete({ where: { id: mirror.id } });
-        }
-      });
-
-      broadcast({ type: "data_changed" });
+      await executeHardDelete();
       return res.json({ message: 'Transaction deleted' });
     }
   } catch (error) {
@@ -2824,14 +3246,18 @@ app.post('/api/transactions/:id/action', authenticateToken, async (req, res) => 
       return res.status(403).json({ error: 'Only admins, editors, or the recipient can approve/reject transactions' });
     }
 
-    // 1. Check if this is an edit/delete request and the requester is trying to approve/reject it.
+    // Edit/delete requests: requester cannot self-approve; only listed parties can approve
     if (txn.pendingAction && ['edit', 'delete'].includes(txn.pendingAction)) {
-      const pendingDataObj = txn.pendingData ? (typeof txn.pendingData === 'string' ? JSON.parse(txn.pendingData) : txn.pendingData) : {};
+      const pendingDataObj = parsePendingData(txn.pendingData);
       if (pendingDataObj.requestedBy === req.user.id) {
-        // Allow self-approval if user has admin/editor access to the book's org
-        const canSelfApprove = await hasAdminOrEditorAccess(txnBook.organizationId, req.user.id);
-        if (!canSelfApprove) {
-          return res.status(403).json({ error: 'You cannot approve or reject your own edit/delete request. The other party must approve it.' });
+        return res.status(403).json({ error: 'You cannot approve or reject your own edit/delete request.' });
+      }
+      const required = pendingDataObj.requiredApprovers || [];
+      const orgAnyOf = pendingDataObj.orgApprovalAnyOf || [];
+      if (required.length > 0 || orgAnyOf.length > 0) {
+        const canApprove = required.includes(req.user.id) || orgAnyOf.includes(req.user.id);
+        if (!canApprove) {
+          return res.status(403).json({ error: 'You are not authorized to approve this edit/delete request.' });
         }
       }
     }
@@ -2946,6 +3372,28 @@ app.post('/api/transactions/:id/action', authenticateToken, async (req, res) => 
       // Handle pendingAction transactions (edit/delete requests)
       if (txn.pendingAction) {
         if (txn.pendingAction === 'edit') {
+          const updatedPendingData = recordChangeDeleteApproval(txn.pendingData, req.user.id);
+          if (!isChangeDeleteFullyApproved(updatedPendingData)) {
+            await prisma.$transaction(async (tx) => {
+              await tx.transaction.update({
+                where: { id: txnId },
+                data: {
+                  pendingData: updatedPendingData,
+                  updateHistory: [...(txn.updateHistory || []), approveHistoryEntry]
+                }
+              });
+              if (txn.linkedTransactionId) {
+                await tx.transaction.update({
+                  where: { id: txn.linkedTransactionId },
+                  data: { pendingData: updatedPendingData }
+                });
+              }
+            });
+            broadcast({ type: 'data_changed' });
+            const remaining = (updatedPendingData.requiredApprovers || []).filter((id) => !(updatedPendingData.approvals || []).includes(id));
+            return res.json({ message: `Edit approval recorded. Waiting for ${remaining.length} more approval(s).` });
+          }
+
           await prisma.$transaction(async (tx) => {
             const current = await tx.transaction.findUnique({ where: { id: txnId }, select: { version: true, updateHistory: true } });
             if (!current) throw new Error('Transaction not found');
@@ -3012,6 +3460,28 @@ app.post('/api/transactions/:id/action', authenticateToken, async (req, res) => 
           broadcast({ type: "data_changed" });
           return res.json({ transaction: updated, message: 'Edit approved' });
         } else if (txn.pendingAction === 'delete') {
+          const updatedPendingData = recordChangeDeleteApproval(txn.pendingData, req.user.id);
+          if (!isChangeDeleteFullyApproved(updatedPendingData)) {
+            await prisma.$transaction(async (tx) => {
+              await tx.transaction.update({
+                where: { id: txnId },
+                data: {
+                  pendingData: updatedPendingData,
+                  updateHistory: [...(txn.updateHistory || []), approveHistoryEntry]
+                }
+              });
+              if (txn.linkedTransactionId) {
+                await tx.transaction.update({
+                  where: { id: txn.linkedTransactionId },
+                  data: { pendingData: updatedPendingData }
+                });
+              }
+            });
+            broadcast({ type: 'data_changed' });
+            const remaining = (updatedPendingData.requiredApprovers || []).filter((id) => !(updatedPendingData.approvals || []).includes(id));
+            return res.json({ message: `Delete approval recorded. Waiting for ${remaining.length} more approval(s).` });
+          }
+
           await prisma.$transaction(async (tx) => {
             if (txn.linkedTransactionId) {
               const linked = await tx.transaction.findUnique({ where: { id: txn.linkedTransactionId } });
@@ -3809,6 +4279,32 @@ app.get('/api/approvals/pending', authenticateToken, async (req, res) => {
       for (const txn of pendingTxns) {
         const isFundVoucher = txn.orgFundId && !adminBookIds.includes(txn.bookId);
         const book = await prisma.book.findUnique({ where: { id: txn.bookId }, include: { organization: true } });
+
+        // Recipient-side income on personal book (linked org Send) — not an admin creation-approval item
+        if (!txn.pendingAction && book?.organization?.isPersonal && txn.type === 'income' && txn.category === 'Send' && txn.linkedTransactionId) {
+          const linkedSource = await prisma.transaction.findUnique({
+            where: { id: txn.linkedTransactionId },
+            include: { book: { include: { organization: { select: { isPersonal: true } } } } }
+          });
+          if (linkedSource?.type === 'expense' && linkedSource?.category === 'Send' && !linkedSource.book?.organization?.isPersonal) {
+            continue;
+          }
+        }
+
+        // Edit/delete requests: only show to required approvers who have not yet approved
+        if (txn.pendingAction && ['edit', 'delete'].includes(txn.pendingAction)) {
+          const pd = parsePendingData(txn.pendingData);
+          if (pd.requestedBy === user.id) continue;
+          const required = pd.requiredApprovers || [];
+          const orgAnyOf = pd.orgApprovalAnyOf || [];
+          if (required.length > 0 || orgAnyOf.length > 0) {
+            const canSee = required.includes(user.id) || orgAnyOf.includes(user.id);
+            if (!canSee) continue;
+            if ((pd.approvals || []).includes(user.id)) continue;
+            if (orgAnyOf.includes(user.id) && orgAnyOf.some((id) => (pd.approvals || []).includes(id))) continue;
+          }
+        }
+
         let recipientName = null;
         if (txn.recipientUserId) {
           const u = await prisma.user.findUnique({ where: { id: txn.recipientUserId }, select: { name: true } });
@@ -3851,12 +4347,38 @@ app.get('/api/approvals/pending', authenticateToken, async (req, res) => {
         const sender = await prisma.user.findUnique({ where: { id: txn.createdById }, select: { name: true } });
         senderName = sender?.name || null;
 
+        let message = txn.note || '';
+        let requesterName = null;
+        let approvalProgress = null;
+        let changeSummaryBn = null;
+        let changeSummaryEn = null;
+        let oldAmount = null;
+        let newAmount = null;
+        let oldNote = null;
+        let newNote = null;
+        let requiredApprovalCount = null;
+
+        if (txn.pendingAction && ['edit', 'delete'].includes(txn.pendingAction)) {
+          const pd = parsePendingData(txn.pendingData);
+          requesterName = pd.requesterName || null;
+          requiredApprovalCount = pd.requiredApprovalCount ?? (pd.requiredApprovers || []).length;
+          const summary = buildChangeDeleteNotification(txn.pendingData, txn.pendingAction, txn);
+          changeSummaryBn = summary.bn;
+          changeSummaryEn = summary.en;
+          message = summary.shortBn;
+          approvalProgress = summary.progress;
+          oldAmount = summary.oldAmount ?? pd.oldAmount ?? null;
+          newAmount = summary.newAmount ?? txn.amount ?? null;
+          oldNote = summary.oldNote ?? pd.oldNote ?? null;
+          newNote = summary.newNote ?? txn.note ?? null;
+        }
+
         result.push({
           type: (txn.category === 'Send' || txn.recipientOrgId) ? 'disbursement_approval' : 'voucher_approval',
           id: txn.id,
           refId: txn.id,
           title: actionLabel,
-          message: txn.note || '',
+          message,
           amount: txn.amount,
           category: txn.category,
           recipientName,
@@ -3868,6 +4390,15 @@ app.get('/api/approvals/pending', authenticateToken, async (req, res) => {
           counterProposedAmount: txn.counterProposedAmount,
           counterProposedBy: txn.counterProposedBy,
           senderName,
+          requesterName,
+          approvalProgress,
+          changeSummaryBn,
+          changeSummaryEn,
+          oldAmount,
+          newAmount,
+          oldNote,
+          newNote,
+          requiredApprovalCount,
           role: 'admin', // sender/admin view
           chainId: txn.chainId,
           chainType: txn.chainType,
@@ -4530,148 +5061,665 @@ app.delete('/api/org/:orgId', authenticateToken, async (req, res) => {
   }
 });
 
+// ─── AI Agent Helpers ───────────────────────────────────────────────────────
+const AI_ACTION_BLOCK_REGEX = /```action\s*([\s\S]*?)```/g;
+
+const stripAiActionBlocks = (text) => (text || '').replace(AI_ACTION_BLOCK_REGEX, '').trim();
+
+const getLastUserMessage = (messages) => {
+  const last = [...(messages || [])].reverse().find(m => m.role === 'user');
+  return (last?.content || '').trim();
+};
+
+const extractTransactionPreviewNotes = (aiResponseText) => {
+  const regex = /\[DATA type:transactions\]([\s\S]*?)\[\/DATA\]/g;
+  const previews = [];
+  for (const match of aiResponseText.matchAll(regex)) {
+    try {
+      const items = JSON.parse(match[1].trim());
+      if (Array.isArray(items)) {
+        for (const item of items) {
+          if (item && typeof item === 'object') previews.push(item);
+        }
+      }
+    } catch (_) { /* skip malformed preview blocks */ }
+  }
+  return previews;
+};
+
+const resolveAiTransactionNote = ({ note, description, amount, previewNotes, lastUserMessage, category }) => {
+  const direct = (note || description || '').trim();
+  if (direct) return direct;
+
+  const parsedAmount = parseFloat(amount);
+  if (Number.isFinite(parsedAmount) && previewNotes?.length) {
+    const match = previewNotes.find(
+      p => p?.note && Math.abs(parseFloat(p.amount) - parsedAmount) < 0.01
+    );
+    if (match?.note) return String(match.note).trim();
+    if (previewNotes.length === 1 && previewNotes[0]?.note) {
+      return String(previewNotes[0].note).trim();
+    }
+  }
+
+  if (lastUserMessage) return lastUserMessage;
+  return (category || 'General').trim();
+};
+
+const detectAiIntent = (messages) => {
+  const lastUser = [...(messages || [])].reverse().find(m => m.role === 'user');
+  const q = (lastUser?.content || '').toLowerCase();
+  if (/(balance|ব্যালেন্স|balence|মোট ব্যালেন্স|total balance|কত টাকা আছে|how much money)/i.test(q)) {
+    return 'balance';
+  }
+  if (/(category|ক্যাটাগরি|খরচের হার|spending breakdown|বিভাগে খরচ|কোন খাতে)/i.test(q)) {
+    return 'category';
+  }
+  if (/(recent|সাম্প্রতিক|latest|গত|last \d+|লেনদেন দেখ|transaction list|লেনদেন তালিকা)/i.test(q)) {
+    return 'recent';
+  }
+  if (/(help|সাহায্য|কী কর|ki korte|how to|কিভাবে)/i.test(q) && !/\d/.test(q)) {
+    return 'help';
+  }
+  if (/\d/.test(q) && /(খরচ|expense|income|আয়|লেনদেন|record|যোগ|add|rickshaw|রিকশা|bazar|বাজার|send|পাঠ)/i.test(q)) {
+    return 'transaction';
+  }
+  return 'general';
+};
+
+const AI_LLM_HISTORY_LIMIT = 6;
+const AI_LLM_CONTENT_LIMIT = 1800;
+
+const truncateAiMessagesForLlm = (messages, maxCount = AI_LLM_HISTORY_LIMIT) => {
+  if (!Array.isArray(messages)) return [];
+  return messages.slice(-maxCount).map(m => ({
+    role: m.role,
+    content: String(m.content || '').slice(0, AI_LLM_CONTENT_LIMIT),
+  }));
+};
+
+const resolveAiMaxTokens = (maxTokens) => {
+  const parsed = maxTokens != null ? parseInt(maxTokens, 10) : 512;
+  if (!Number.isFinite(parsed)) return 512;
+  return Math.min(Math.max(parsed, 128), 1024);
+};
+
+const saveAiChatTurn = async ({ userId, userMessage, assistantMessage, bookId, model, provider, intent }) => {
+  const userText = String(userMessage || '').trim();
+  const assistantText = String(assistantMessage || '').trim();
+  if (!userId || !userText || !assistantText) return;
+  try {
+    await prisma.aiChatMessage.createMany({
+      data: [
+        { userId, role: 'user', content: userText, bookId: bookId || null, model: model || null, provider: provider || null, intent: intent || null },
+        { userId, role: 'assistant', content: assistantText, bookId: bookId || null, model: model || null, provider: provider || null, intent: intent || null },
+      ],
+    });
+  } catch (error) {
+    console.error('[AI Chat] Failed to save turn:', error);
+  }
+};
+
+const tryOffTopicAiResponse = (messages, agentCtx) => {
+  const lastUserMessage = getLastUserMessage(messages);
+  const { intent } = agentCtx;
+  if (intent !== 'general') return { handled: false };
+
+  const appRelated = /(hisab|হিসাব|pata|পাতা|balance|ব্যালেন্স|transaction|লেনদেন|book|খাতা|org|সংগঠন|send|expense|income|খরচ|আয়|category|approval|অনুমোদন|টাকা|taka|ledger|account|fund|rickshaw|বাজার|salary|বেতন|personal|member|admin|editor)/i;
+  if (appRelated.test(lastUserMessage || '')) return { handled: false };
+
+  const isBn = isBanglaMessage(lastUserMessage);
+  const text = isBn
+    ? 'আমি শুধু হিসাব পাতা অ্যাপের হিসাব, খাতা ও লেনদেন নিয়ে সাহায্য করি। ব্যালেন্স, খরচ বা লেনদেন যোগ করতে বলুন।'
+    : 'I only help with Hisab Pata books, balances, and transactions. Ask about your balance, spending, or adding a transaction.';
+  return { handled: true, cleanResponse: text, proposedActions: [] };
+};
+
+const isBanglaMessage = (text) => /[\u0980-\u09FF]/.test(text || '');
+
+const CATEGORY_KEYWORDS = [
+  { keys: ['rickshaw', 'রিকশা', 'bus', 'বাস', 'transport', 'যাতায়াত', 'pathao', 'uber', 'cng'], cat: 'Transport' },
+  { keys: ['food', 'খাবার', 'breakfast', 'lunch', 'dinner', 'snack', 'নাস্তা'], cat: 'Food' },
+  { keys: ['bazar', 'বাজার', 'market', 'grocery', 'সবজি'], cat: 'Shopping' },
+  { keys: ['bill', 'বিল', 'electric', 'gas', 'internet', 'mobile'], cat: 'Bills' },
+  { keys: ['salary', 'বেতন', 'income', 'আয়', 'donation', 'দান'], cat: 'Income' },
+  { keys: ['medicine', 'doctor', 'চিকিৎসা', 'hospital'], cat: 'Medical' },
+  { keys: ['education', 'school', 'college', 'শিক্ষা', 'book'], cat: 'Education' },
+];
+
+const parseTransactionHints = (text, booksWithOrg, defaultBookId) => {
+  const q = (text || '').toLowerCase();
+  const amountMatch = (text || '').match(/(\d+(?:[.,]\d+)?)\s*(?:টাকা|taka|tk|bdt|৳)?/i);
+  const amount = amountMatch ? parseFloat(String(amountMatch[1]).replace(',', '')) : null;
+
+  let type = 'expense';
+  if (/(income|আয়|salary|বেতন|received|পেলাম|জমা|donation|দান)/i.test(text || '')) {
+    type = 'income';
+  }
+
+  let category = type === 'income' ? 'Income' : 'General';
+  for (const { keys, cat } of CATEGORY_KEYWORDS) {
+    if (keys.some(k => q.includes(k.toLowerCase()))) {
+      category = cat;
+      break;
+    }
+  }
+
+  let matchedEntry = null;
+  for (const entry of booksWithOrg) {
+    const name = entry.book.name.toLowerCase();
+    if (name.length > 2 && q.includes(name)) {
+      matchedEntry = entry;
+      break;
+    }
+  }
+  if (!matchedEntry && /(personal|পার্সোনাল|personal book|নিজের)/i.test(text || '')) {
+    matchedEntry = booksWithOrg.find(x => x.isPersonal) || null;
+  }
+  if (!matchedEntry && defaultBookId) {
+    matchedEntry = booksWithOrg.find(x => x.book.id === defaultBookId) || null;
+  }
+
+  return {
+    amount,
+    type,
+    category,
+    bookId: matchedEntry?.book.id || null,
+    bookName: matchedEntry?.book.name || null,
+    orgName: matchedEntry?.orgName || null,
+    isPersonal: matchedEntry?.isPersonal ?? null,
+  };
+};
+
+const resolveBookFromMessage = (text, booksWithOrg, defaultBookId) => {
+  const hints = parseTransactionHints(text, booksWithOrg, defaultBookId);
+  return hints.bookId || defaultBookId || null;
+};
+
+const formatTransactionsDataBlock = (transactions) => {
+  const payload = transactions.map(t => ({
+    note: t.note || t.category || '',
+    amount: t.amount,
+    type: t.type || 'expense',
+    category: t.category || 'General',
+  }));
+  return `[DATA type:transactions]\n${JSON.stringify(payload)}\n[/DATA]`;
+};
+
+const buildTransactionAction = (hints, lastUserMessage, bookRecord) => ({
+  action: 'create_transaction',
+  data: {
+    bookId: bookRecord.id,
+    bookName: bookRecord.name,
+    orgName: bookRecord.organization?.name || 'Unknown',
+    type: hints.type,
+    amount: hints.amount,
+    category: hints.category,
+    note: resolveAiTransactionNote({
+      note: '',
+      description: '',
+      amount: hints.amount,
+      previewNotes: [{ note: lastUserMessage, amount: hints.amount }],
+      lastUserMessage,
+      category: hints.category,
+    }),
+    dateTime: new Date().toISOString(),
+    contact: '',
+    recipientUserId: null,
+    orgFundId: null,
+  },
+  valid: true,
+});
+
+const tryDeterministicAiResponse = async (messages, agentCtx, userId) => {
+  const lastUserMessage = getLastUserMessage(messages);
+  const isBn = isBanglaMessage(lastUserMessage);
+  const { intent, serverToolData, contextBookId, booksWithOrg, recentTxns, pendingApprovalCount } = agentCtx;
+
+  if (intent === 'balance' && serverToolData.balanceBlock) {
+    const books = serverToolData.balanceBooks || [];
+    const total = books.reduce((sum, b) => sum + (b.balance || 0), 0);
+    const text = isBn
+      ? `আপনার ${books.length}টি খাতার মোট ব্যালেন্স ৳${Math.round(total)}।`
+      : `Total balance across ${books.length} book(s): ৳${Math.round(total)}.`;
+    return {
+      handled: true,
+      cleanResponse: `${text}\n\n${serverToolData.balanceBlock}`,
+      proposedActions: [],
+    };
+  }
+
+  if (intent === 'category' && serverToolData.categoryBlock) {
+    const text = isBn
+      ? 'আপনার approved খরচের ক্যাটাগরি breakdown নিচে দেখুন।'
+      : 'Here is your approved spending breakdown by category.';
+    return {
+      handled: true,
+      cleanResponse: `${text}\n\n${serverToolData.categoryBlock}`,
+      proposedActions: [],
+    };
+  }
+
+  if (intent === 'recent' && recentTxns?.length) {
+    const preview = recentTxns.slice(0, 12).map(t => ({
+      note: t.note || t.category || '',
+      amount: t.amount,
+      type: t.type,
+      category: t.category,
+    }));
+    const text = isBn
+      ? `সর্বশেষ ${preview.length}টি লেনদেন নিচে দেখুন।`
+      : `Here are your latest ${preview.length} transactions.`;
+    return {
+      handled: true,
+      cleanResponse: `${text}\n\n${formatTransactionsDataBlock(preview)}`,
+      proposedActions: [],
+    };
+  }
+
+  if (intent === 'help') {
+    const text = isBn
+      ? 'আপনি বলতে পারেন: "আমার ব্যালেন্স দেখাও", "ক্যাটাগরি অনুযায়ী খরচ", "personal book-এ ৫০ টাকা rickshaw খরচ"। লেনদেন approve করতে হবে।'
+      : 'Try: "show my balance", "spending by category", or "add 50 taka rickshaw expense to personal book". Transactions need your approval.';
+    return { handled: true, cleanResponse: text, proposedActions: [] };
+  }
+
+  if (intent === 'transaction' && agentCtx.transactionHints?.amount && agentCtx.transactionHints?.bookId) {
+    const hints = agentCtx.transactionHints;
+    const book = await prisma.book.findFirst({
+      where: { id: hints.bookId },
+      include: { organization: { include: { members: { where: { userId } } } } },
+    });
+    if (book && book.organization.members.length > 0) {
+      const action = buildTransactionAction(hints, lastUserMessage, book);
+      const preview = formatTransactionsDataBlock([{
+        note: action.data.note,
+        amount: action.data.amount,
+        type: action.data.type,
+        category: action.data.category,
+      }]);
+      const text = isBn
+        ? `${book.name} খাতায় ৳${hints.amount} ${hints.type === 'income' ? 'আয়' : 'খরচ'} approval-এর জন্য প্রস্তুত।`
+        : `Ready to add ৳${hints.amount} ${hints.type} to "${book.name}" for your approval.`;
+      return {
+        handled: true,
+        cleanResponse: `${text}\n\n${preview}`,
+        proposedActions: [action],
+      };
+    }
+  }
+
+  return { handled: false };
+};
+
+const fetchAiCategorySummary = async (userId, bookId) => {
+  const memberships = await prisma.organizationMember.findMany({
+    where: { userId, status: 'active' },
+    include: { organization: { include: { books: true } } },
+  });
+  const bookIds = bookId
+    ? [bookId]
+    : memberships.flatMap(m => m.organization.books.map(b => b.id));
+  const transactions = await prisma.transaction.findMany({
+    where: { bookId: { in: bookIds }, type: 'expense', reconStatus: 'approved' },
+    select: { category: true, amount: true },
+  });
+  const summary = {};
+  let total = 0;
+  for (const t of transactions) {
+    const cat = t.category || 'Other';
+    summary[cat] = (summary[cat] || 0) + t.amount;
+    total += t.amount;
+  }
+  return Object.entries(summary)
+    .map(([category, amount]) => ({
+      category,
+      amount: Math.round(amount * 100) / 100,
+      percentage: total > 0 ? Math.round((amount / total) * 100) : 0,
+      count: transactions.filter(t => (t.category || 'Other') === category).length,
+    }))
+    .sort((a, b) => b.amount - a.amount);
+};
+
+const formatBalanceDataBlock = (books) => {
+  const payload = books.map(b => ({ book: b.name, balance: b.balance, org: b.organization }));
+  return `[DATA type:balance]\n${JSON.stringify(payload)}\n[/DATA]`;
+};
+
+const formatCategoryDataBlock = (categories) => {
+  const payload = categories.map(c => ({
+    category: c.category,
+    amount: c.amount,
+    count: c.count,
+    percentage: c.percentage,
+  }));
+  return `[DATA type:category]\n${JSON.stringify(payload)}\n[/DATA]`;
+};
+
+const prepareAiAgentRequest = async (userId, bookId, messages) => {
+  const userOrgs = await prisma.organizationMember.findMany({
+    where: { userId, status: 'active' },
+    include: { organization: { include: { books: true } } },
+  });
+
+  const booksWithOrg = userOrgs.flatMap(m =>
+    m.organization.books.map(b => ({
+      book: b,
+      orgName: m.organization.name,
+      isPersonal: m.organization.isPersonal,
+      role: m.role,
+    }))
+  );
+
+  const allBooks = booksWithOrg.map(x => x.book);
+  let contextBookId = resolveBookFromMessage(getLastUserMessage(messages), booksWithOrg, bookId);
+  if (!contextBookId && allBooks.length > 0) {
+    contextBookId = (allBooks.find(b => b.isDefault) || allBooks[0]).id;
+  }
+
+  const recentTxns = contextBookId
+    ? await prisma.transaction.findMany({
+        where: { bookId: contextBookId },
+        orderBy: { dateTime: 'desc' },
+        take: 8,
+      })
+    : [];
+
+  const pendingApprovalCount = await prisma.transaction.count({
+    where: {
+      reconStatus: { in: ['pending_org', 'pending_recipient', 'pending'] },
+      book: { organization: { members: { some: { userId, status: 'active' } } } },
+    },
+  });
+
+  const userData = await prisma.user.findUnique({ where: { id: userId } });
+  const intent = detectAiIntent(messages);
+  const lastUserMessage = getLastUserMessage(messages);
+  const booksForAiTxn = booksWithOrg.filter(({ role, isPersonal }) =>
+    isPersonal || role === 'admin' || role === 'editor'
+  );
+  const transactionHints = parseTransactionHints(lastUserMessage, booksForAiTxn, contextBookId);
+  const activeBookEntry = booksWithOrg.find(x => x.book.id === contextBookId);
+  const recommendedTemperature = ['balance', 'category', 'recent', 'transaction', 'help'].includes(intent) ? 0.2 : 0.45;
+
+  const orgSummary = userOrgs
+    .filter(m => !m.organization.isPersonal)
+    .map(m => `Org:"${m.organization.name}" Role:${m.role}`)
+    .join(' | ') || 'None';
+
+  const booksSummary = booksWithOrg
+    .map(({ book, orgName, isPersonal, role }) =>
+      `- ID:${book.id} Name:"${book.name}" Balance:${book.balance} BDT Org:"${isPersonal ? 'Personal' : orgName}" Role:${role}`)
+    .join('\n');
+
+  const txnSummary = recentTxns
+    .map(t => `${t.type} ${t.amount} ${t.category || ''} ${(t.note || '').slice(0, 40)}`)
+    .join(' | ') || 'None';
+
+  const serverToolData = {};
+  const balanceBooks = booksWithOrg.map(({ book, orgName, isPersonal }) => ({
+    name: book.name,
+    balance: book.balance,
+    organization: isPersonal ? 'Personal' : orgName,
+  }));
+
+  if (intent === 'balance') {
+    serverToolData.balanceBlock = formatBalanceDataBlock(balanceBooks);
+    serverToolData.balanceBooks = balanceBooks;
+  }
+  if (intent === 'category') {
+    const categories = await fetchAiCategorySummary(userId, contextBookId);
+    serverToolData.categoryBlock = formatCategoryDataBlock(categories);
+  }
+
+  const hintsSection = transactionHints.amount
+    ? `PARSED FROM USER MESSAGE: amount=${transactionHints.amount} type=${transactionHints.type} category=${transactionHints.category} bookId=${transactionHints.bookId || 'MISSING'} bookName="${transactionHints.bookName || ''}"`
+    : 'PARSED FROM USER MESSAGE: amount not detected';
+
+  const verifiedDataSection = [
+    intent === 'balance' && serverToolData.balanceBlock
+      ? `VERIFIED BALANCE DATA (copy this DATA block exactly, do not invent numbers):\n${serverToolData.balanceBlock}`
+      : null,
+    intent === 'category' && serverToolData.categoryBlock
+      ? `VERIFIED CATEGORY DATA (copy this DATA block exactly, do not invent numbers):\n${serverToolData.categoryBlock}`
+      : null,
+  ].filter(Boolean).join('\n\n');
+
+  const today = new Date().toISOString().split('T')[0];
+  const systemPrompt = `You are Hisab Pata AI — finance assistant ONLY for the Hisab Pata ledger app.
+
+SCOPE (strict):
+- Answer ONLY about this app's books, balances, transactions, categories, approvals, org rules.
+- If the user asks anything unrelated (general knowledge, other apps, coding, news, jokes), refuse in ONE short sentence and redirect to app finance tasks.
+- Never discuss other products or your underlying AI model.
+
+RULES:
+- Personal org is not a real organization. Org book outflow is Send only.
+- Never say a transaction is saved; say it is ready for user approval.
+- Use book IDs from USER BOOKS for transaction actions.
+
+USER: ${userData?.name || 'User'}
+ACTIVE BOOK: ${activeBookEntry ? `"${activeBookEntry.book.name}" (${activeBookEntry.book.id})` : 'None'}
+PENDING APPROVALS: ${pendingApprovalCount}
+ORGS: ${orgSummary}
+BOOKS:
+${booksSummary || 'None'}
+RECENT TXNS: ${txnSummary}
+${hintsSection}
+${verifiedDataSection ? `\nVERIFIED DATA:\n${verifiedDataSection}\n` : ''}
+
+TRANSACTIONS: use PARSED values when bookId exists; otherwise ask which book (names only). note is required from user's words.
+
+RESPONSE:
+- Plain text, no markdown. Max 2 short sentences (Bangla or English).
+- Include VERIFIED DATA blocks unchanged for balance/category.
+- For new transactions with amount+book: add [DATA type:transactions] preview + action block:
+\`\`\`action
+{"action":"create_transaction","data":{"bookId":"<id>","type":"expense","amount":500,"category":"Transport","note":"...","dateTime":"${today}"}}
+\`\`\`
+
+DATA formats:
+[DATA type:balance] [{"book":"Name","balance":1000,"org":"OrgName"}] [/DATA]
+[DATA type:category] [{"category":"Food","amount":500,"count":3,"percentage":40}] [/DATA]
+[DATA type:transactions] [{"note":"...","amount":50,"type":"expense","category":"Transport"}] [/DATA]
+
+If amount or book missing, ask ONE clarifying question. No action blocks yet.`;
+
+  return {
+    systemPrompt,
+    contextBookId,
+    intent,
+    serverToolData,
+    booksWithOrg,
+    recentTxns,
+    pendingApprovalCount,
+    transactionHints,
+    recommendedTemperature,
+  };
+};
+
+const parseAiAgentActions = async (aiResponseText, contextBookId, userId, { onComplaint, lastUserMessage, previewNotes } = {}) => {
+  const matches = [...aiResponseText.matchAll(AI_ACTION_BLOCK_REGEX)];
+  let cleanResponse = stripAiActionBlocks(aiResponseText);
+  const proposedActions = [];
+  const txnPreviews = previewNotes || extractTransactionPreviewNotes(aiResponseText);
+  const userMsg = lastUserMessage || '';
+
+  for (const match of matches) {
+    try {
+      const actionData = JSON.parse(match[1].trim());
+      if (actionData.action === 'create_transaction' && actionData.data) {
+        const { bookId: txnBookId, type, amount, category, note, dateTime, contact, recipientUserId, orgFundId, description } = actionData.data;
+        const resolvedNote = resolveAiTransactionNote({
+          note,
+          description,
+          amount,
+          previewNotes: txnPreviews,
+          lastUserMessage: userMsg,
+          category,
+        });
+        const book = await prisma.book.findFirst({
+          where: { id: txnBookId || contextBookId },
+          include: { organization: { include: { members: { where: { userId } } } } },
+        });
+        if (!book || book.organization.members.length === 0) {
+          proposedActions.push({
+            action: 'create_transaction',
+            data: { ...actionData.data, note: resolvedNote },
+            valid: false,
+            reason: 'Book not found or access denied',
+          });
+        } else {
+          proposedActions.push({
+            action: 'create_transaction',
+            data: {
+              bookId: book.id,
+              bookName: book.name,
+              orgName: book.organization?.name || 'Unknown',
+              type,
+              amount: parseFloat(amount),
+              category: category || 'General',
+              note: resolvedNote,
+              dateTime: dateTime ? new Date(dateTime) : new Date().toISOString(),
+              contact: contact || '',
+              recipientUserId: recipientUserId || null,
+              orgFundId: orgFundId || null,
+            },
+            valid: true,
+          });
+        }
+      }
+      if (actionData.action === 'create_complaint' && actionData.data) {
+        const { subject, message, category } = actionData.data;
+        if (subject && message) {
+          try {
+            const complaint = await prisma.complaint.create({
+              data: { userId, subject, message, category: category || 'Other' },
+            });
+            if (onComplaint) {
+              onComplaint({ subject, id: complaint.id });
+            } else {
+              cleanResponse += `\n\nআপনার রিপোর্ট "${subject}" জমা হয়েছে।`;
+            }
+          } catch (err) {
+            console.error('[AI Agent] Auto-execute complaint failed:', err);
+          }
+        }
+      }
+    } catch (parseErr) {
+      console.error('[AI Agent] Action parse error:', parseErr);
+    }
+  }
+
+  return { cleanResponse, proposedActions };
+};
+
+const finalizeAiAgentResponse = async (aiResponseText, { contextBookId, userId, intent, serverToolData, onComplaint, messages }) => {
+  const lastUserMessage = getLastUserMessage(messages);
+  const previewNotes = extractTransactionPreviewNotes(aiResponseText);
+  const { cleanResponse: baseClean, proposedActions } = await parseAiAgentActions(
+    aiResponseText,
+    contextBookId,
+    userId,
+    { onComplaint, lastUserMessage, previewNotes }
+  );
+  let cleanResponse = baseClean;
+
+  if (intent === 'balance' && serverToolData?.balanceBlock && !cleanResponse.includes('[DATA type:balance]')) {
+    cleanResponse = cleanResponse
+      ? `${cleanResponse}\n\n${serverToolData.balanceBlock}`
+      : serverToolData.balanceBlock;
+  }
+  if (intent === 'category' && serverToolData?.categoryBlock && !cleanResponse.includes('[DATA type:category]')) {
+    cleanResponse = cleanResponse
+      ? `${cleanResponse}\n\n${serverToolData.categoryBlock}`
+      : serverToolData.categoryBlock;
+  }
+
+  return { cleanResponse: cleanResponse.trim(), proposedActions };
+};
+
+const emitAiStreamFinal = async (sendEvent, fullText, agentCtx, userId, messages, meta = {}) => {
+  const { cleanResponse, proposedActions } = await finalizeAiAgentResponse(fullText, {
+    ...agentCtx,
+    userId,
+    messages,
+    onComplaint: ({ subject, id }) => sendEvent('auto_action', { action: 'create_complaint', subject, id }),
+  });
+  if (proposedActions.length > 0) sendEvent('actions', { actions: proposedActions });
+  sendEvent('clean', { response: cleanResponse });
+  await saveAiChatTurn({
+    userId,
+    userMessage: getLastUserMessage(messages),
+    assistantMessage: cleanResponse,
+    bookId: agentCtx.contextBookId,
+    model: meta.model || null,
+    provider: meta.provider || null,
+    intent: agentCtx.intent || null,
+  });
+};
+
 // ─────────────────────────────────────────────────────────────────────────────
 // AGENTIC AI ROUTE — Tool Calling & Action Execution
 // ─────────────────────────────────────────────────────────────────────────────
 app.post('/api/ai/agent', authenticateToken, async (req, res) => {
   try {
-    const { provider, apiKey, model, baseUrl, messages, bookId, orgId, temperature, maxTokens } = req.body;
+    const storedConfig = await loadUserAiConfig(req.user.id);
+    const resolved = resolveAiRequestConfig(req.body, storedConfig);
+    const { provider, apiKey, model, baseUrl, messages, bookId, orgId, temperature, maxTokens } = {
+      ...req.body,
+      provider: resolved.provider,
+      apiKey: resolved.apiKey,
+      model: resolved.model,
+      baseUrl: resolved.baseUrl,
+      temperature: resolved.temperature,
+      maxTokens: resolved.maxTokens,
+    };
 
     if (!provider || !apiKey || !model || !messages) {
       return res.status(400).json({ error: 'Missing required fields: provider, apiKey, model, messages' });
     }
 
-    // ── Fetch financial context ──
-    const userOrgs = await prisma.organizationMember.findMany({
-      where: { userId: req.user.id, status: 'active' },
-      include: { organization: { include: { books: true } } }
-    });
+    const agentCtx = await prepareAiAgentRequest(req.user.id, bookId, messages);
+    const { systemPrompt, contextBookId, intent, serverToolData, recommendedTemperature } = agentCtx;
+    const llmMessages = truncateAiMessagesForLlm(messages);
 
-    const allBooks = userOrgs.flatMap(m => m.organization.books);
-
-    let contextBookId = bookId;
-    if (!contextBookId && allBooks.length > 0) {
-      const defaultBook = allBooks.find(b => b.isDefault) || allBooks[0];
-      contextBookId = defaultBook.id;
+    const deterministic = await tryDeterministicAiResponse(messages, agentCtx, req.user.id);
+    if (deterministic.handled) {
+      await saveAiChatTurn({
+        userId: req.user.id,
+        userMessage: getLastUserMessage(messages),
+        assistantMessage: deterministic.cleanResponse,
+        bookId: contextBookId,
+        model,
+        provider,
+        intent,
+      });
+      return res.json({
+        response: deterministic.cleanResponse,
+        proposedActions: deterministic.proposedActions || [],
+      });
     }
 
-    const recentTxns = contextBookId ? await prisma.transaction.findMany({
-      where: { bookId: contextBookId },
-      orderBy: { dateTime: 'desc' },
-      take: 30
-    }) : [];
+    const offTopic = tryOffTopicAiResponse(messages, agentCtx);
+    if (offTopic.handled) {
+      await saveAiChatTurn({
+        userId: req.user.id,
+        userMessage: getLastUserMessage(messages),
+        assistantMessage: offTopic.cleanResponse,
+        bookId: contextBookId,
+        model,
+        provider,
+        intent: 'off_topic',
+      });
+      return res.json({
+        response: offTopic.cleanResponse,
+        proposedActions: [],
+      });
+    }
 
-    const userData = await prisma.user.findUnique({ where: { id: req.user.id } });
-
-    const orgSummary = userOrgs.map(m =>
-      `Org: "${m.organization.name}" | Role: ${m.role}`
-    ).join('\n');
-
-    const booksSummary = allBooks.map(b =>
-      `- ID:${b.id} | Name:"${b.name}" | Balance:${b.balance} BDT | Org: "${b.organization?.name || 'Unknown'}"`
-    ).join('\n');
-
-    const txnSummary = recentTxns.map(t =>
-      `- ${t.dateTime?.toISOString?.().split('T')[0] || ''}: ${t.type} of ${t.amount} BDT | Category:"${t.category}" | Note:"${t.note || ''}"`
-    ).join('\n');
-
-    // ── System Prompt ──
-    const systemPrompt = `You are Hisab Pata AI — a Bangladeshi personal finance assistant.
-
-=== PROMPT DIRECTORY & ROUTING ===
-Identify the user's intent and follow the matching guidelines below:
-1. For general chat/help: Follow [## SECTION A: GENERAL GUIDELINES]
-2. For adding/recording transactions: Follow [## SECTION B: TRANSACTION CREATION]
-3. For balance, category, or trend summaries: Follow [## SECTION C: FINANCIAL ANALYSIS & REPORTS]
-4. For custom UI rendering: Follow [## SECTION D: CUSTOM DATA CARDS FORMATTING]
-=================================
-
-## SECTION A: GENERAL GUIDELINES
-- NEVER use markdown, asterisks, quotes, or special characters. Plain text ONLY.
-- Respond in MAX 2-3 sentences for regular answers. Short and direct.
-- Always respond in the same language the user writes in (typically Bangla or English).
-- NEVER say "recorded" or "added" for transactions in text response. Say "ready for your approval" (or approval er jonno ready).
-- USER INFO: Name: ${userData?.name || 'User'} | Email: ${userData?.email || 'Unknown'}
-- USER'S ORGANIZATIONS: ${orgSummary || 'None'}
-- USER'S BOOKS: ${booksSummary || 'None'}
-- RECENT TRANSACTIONS: ${txnSummary || 'None'}
-
-## SECTION B: TRANSACTION CREATION
-1. First check if all required details are present:
-   - Amount (the numerical value of the transaction, e.g. 500 BDT)
-   - Target Book (must clearly correspond to one of USER'S BOOKS by ID or name; ask user to clarify/select if ambiguous or unspecified)
-2. If any of the required details above is missing, incomplete, or ambiguous:
-   - DO NOT output the '[DATA type:transactions]' block.
-   - DO NOT output any action blocks.
-   - Instead, reply to the user asking them politely to specify the missing information (e.g., "কত টাকা খরচ হয়েছে?" or "কোন হিসাব খাতায় এটি যোগ করব?"). Do NOT perform entry creation until these are clear.
-3. ONLY when all details are fully specified:
-   - Parse the description and break into multiple logical transactions if needed.
-   - Show them in a '[DATA type:transactions]' block (refer to Section D for format).
-   - Include the action block for EACH transaction at the end.
-   - Ask user to confirm.
-
-## SECTION C: FINANCIAL ANALYSIS & REPORTS
-- When user asks for insights, summaries, balances, or breakdowns, analyze the user's books and recent transactions.
-- Keep the textual analysis short (max 1-2 lines) and always pair it with the corresponding custom UI data card from Section D.
-
-## SECTION D: CUSTOM DATA CARDS FORMATTING
-The app contains custom code to render beautiful cards/tables when you output structured DATA blocks. To display premium widgets, append the appropriate DATA block at the end of your response:
-
-1. Balance Summary Card:
-[DATA type:balance]
-[{"book":"Personal","balance":15000,"org":"Personal"},{"book":"Office","balance":30000,"org":"Dhaka Office"}]
-[/DATA]
-
-2. Category Spending Card:
-[DATA type:category]
-[{"category":"Food","amount":5000,"count":12},{"category":"Transport","amount":2000,"count":8}]
-[/DATA]
-
-3. Proposed Transactions List Card:
-[DATA type:transactions]
-[{"note":"Rickshaw from Mugda","amount":50,"type":"expense","category":"Transport"},{"note":"Breakfast","amount":120,"type":"expense","category":"Food"}]
-[/DATA]
-
-Action block format (MULTIPLE allowed, one per transaction):
-\`\`\`action
-{
-  "action": "create_transaction",
-  "data": {
-    "bookId": "<book_id>",
-    "type": "income" or "expense",
-    "amount": <number>,
-    "category": "<category>",
-    "note": "<note>",
-    "dateTime": "<ISO date string>",
-    "contact": "<name or phone (optional)>",
-    "recipientUserId": "<user_id if sending money>",
-    "orgFundId": "<fund_id if applicable>"
-  }
-}
-\`\`\`
-
-For bug/complaint:
-\`\`\`action
-{
-  "action": "create_complaint",
-  "data": {
-    "subject": "<short title>",
-    "message": "<details>",
-    "category": "Bug" or "Feature Request" or "Account Issue" or "Other"
-  }
-}
-\`\`\`
-
-## STRICT RULES:
-1. For summaries/balances — use DATA block. Text response max 1 line.
-2. For creating transactions — use action blocks. Can have MULTIPLE blocks.
-3. Categories: খাবার, যাতায়াত, বাজার, বিল, বেতন, ব্যবসা, দান, শিক্ষা, চিকিৎসা, বিনোদন
-4. Use today: ${new Date().toISOString().split('T')[0]}
-5. Output PLAIN TEXT only. No symbols, no formatting chars (no asterisks, no quotes).`;
-
-
-    const tempVal = temperature != null ? parseFloat(temperature) : 0.7;
-    const maxTokVal = maxTokens != null ? parseInt(maxTokens) : 2048;
+    const tempVal = temperature != null ? parseFloat(temperature) : recommendedTemperature;
+    const maxTokVal = resolveAiMaxTokens(maxTokens);
 
     // ── Forward to AI Provider ──
     let aiResponseText = '';
@@ -4681,7 +5729,7 @@ For bug/complaint:
         ? `${baseUrl}/v1beta/models/${model}:generateContent?key=${apiKey}`
         : `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
 
-      const contents = messages.map(m => ({
+      const contents = llmMessages.map(m => ({
         role: m.role === 'user' ? 'user' : 'model',
         parts: [{ text: m.content }]
       }));
@@ -4705,7 +5753,7 @@ For bug/complaint:
       const url = baseUrl ? `${baseUrl}/v1/chat/completions` : 'https://api.openai.com/v1/chat/completions';
       const formattedMessages = [
         { role: 'system', content: systemPrompt },
-        ...messages.map(m => ({ role: m.role, content: m.content }))
+        ...llmMessages.map(m => ({ role: m.role, content: m.content }))
       ];
 
       const openaiRes = await fetch(url, {
@@ -4736,7 +5784,7 @@ For bug/complaint:
           max_tokens: maxTokVal,
           temperature: tempVal,
           system: systemPrompt,
-          messages: messages.map(m => ({ role: m.role, content: m.content }))
+          messages: llmMessages.map(m => ({ role: m.role, content: m.content }))
         })
       });
       const claudeData = await claudeRes.json();
@@ -4749,76 +5797,23 @@ For bug/complaint:
       return res.status(400).json({ error: 'Unsupported provider' });
     }
 
-    // ── Parse Actions from AI Response ───
-    // - create_transaction: added to proposedActions (user must approve)
-    // - create_complaint: auto-executed (no approval needed)
-    const actionBlockRegex = /```action\s*([\s\S]*?)```/g;
-    const matches = [...aiResponseText.matchAll(actionBlockRegex)];
-    let cleanResponse = aiResponseText.replace(actionBlockRegex, '').trim();
+    const { cleanResponse, proposedActions } = await finalizeAiAgentResponse(aiResponseText, {
+      contextBookId,
+      userId: req.user.id,
+      intent,
+      serverToolData,
+      messages,
+    });
 
-    const proposedActions = [];
-    const autoExecuted = [];
-
-    for (const match of matches) {
-      try {
-        const actionData = JSON.parse(match[1].trim());
-
-        if (actionData.action === 'create_transaction' && actionData.data) {
-          const { bookId: txnBookId, type, amount, category, note, dateTime, contact, recipientUserId, orgFundId } = actionData.data;
-
-          // Validate book access (check only, don't execute)
-          const book = await prisma.book.findFirst({
-            where: { id: txnBookId || contextBookId },
-            include: { organization: { include: { members: { where: { userId: req.user.id } } } } }
-          });
-
-          if (!book || book.organization.members.length === 0) {
-            proposedActions.push({
-              action: 'create_transaction',
-              data: actionData.data,
-              valid: false,
-              reason: 'Book not found or access denied',
-            });
-          } else {
-            const parsedAmount = parseFloat(amount);
-            proposedActions.push({
-              action: 'create_transaction',
-              data: {
-                bookId: book.id,
-                bookName: book.name,
-                orgName: book.organization?.name || 'Unknown',
-                type,
-                amount: parsedAmount,
-                category: category || 'General',
-                note: note || '',
-                dateTime: dateTime ? new Date(dateTime) : new Date().toISOString(),
-                contact: contact || '',
-                recipientUserId: recipientUserId || null,
-                orgFundId: orgFundId || null,
-              },
-              valid: true,
-            });
-          }
-        }
-
-        if (actionData.action === 'create_complaint' && actionData.data) {
-          const { subject, message, category } = actionData.data;
-          if (subject && message) {
-            try {
-              const complaint = await prisma.complaint.create({
-                data: { userId: req.user.id, subject, message, category: category || 'Other' },
-              });
-              autoExecuted.push({ action: 'create_complaint', subject, id: complaint.id });
-              cleanResponse += `\n\n⚠️ I've filed a report: "${subject}". Our team will look into it.`;
-            } catch (err) {
-              console.error('[AI Agent] Auto-execute complaint failed:', err);
-            }
-          }
-        }
-      } catch (parseErr) {
-        console.error('[AI Agent] Action parse error:', parseErr);
-      }
-    }
+    await saveAiChatTurn({
+      userId: req.user.id,
+      userMessage: getLastUserMessage(messages),
+      assistantMessage: cleanResponse,
+      bookId: contextBookId,
+      model,
+      provider,
+      intent,
+    });
 
     return res.json({
       response: cleanResponse,
@@ -4836,138 +5831,25 @@ For bug/complaint:
 // ─────────────────────────────────────────────────────────────────────────────
 app.post('/api/ai/agent/stream', authenticateToken, async (req, res) => {
   try {
-    const { provider, apiKey, model, baseUrl, messages, bookId, orgId, temperature, maxTokens } = req.body;
+    const storedConfig = await loadUserAiConfig(req.user.id);
+    const resolved = resolveAiRequestConfig(req.body, storedConfig);
+    const { provider, apiKey, model, baseUrl, messages, bookId, orgId, temperature, maxTokens } = {
+      ...req.body,
+      provider: resolved.provider,
+      apiKey: resolved.apiKey,
+      model: resolved.model,
+      baseUrl: resolved.baseUrl,
+      temperature: resolved.temperature,
+      maxTokens: resolved.maxTokens,
+    };
 
     if (!provider || !apiKey || !model || !messages) {
       return res.status(400).json({ error: 'Missing required fields: provider, apiKey, model, messages' });
     }
 
-    // ── Fetch financial context ──
-    const userOrgs = await prisma.organizationMember.findMany({
-      where: { userId: req.user.id, status: 'active' },
-      include: { organization: { include: { books: true } } }
-    });
-
-    const allBooks = userOrgs.flatMap(m => m.organization.books);
-
-    let contextBookId = bookId;
-    if (!contextBookId && allBooks.length > 0) {
-      const defaultBook = allBooks.find(b => b.isDefault) || allBooks[0];
-      contextBookId = defaultBook.id;
-    }
-
-    const recentTxns = contextBookId ? await prisma.transaction.findMany({
-      where: { bookId: contextBookId },
-      orderBy: { dateTime: 'desc' },
-      take: 30
-    }) : [];
-
-    const userData = await prisma.user.findUnique({ where: { id: req.user.id } });
-
-    const orgSummary = userOrgs.map(m =>
-      `Org: "${m.organization.name}" | Role: ${m.role}`
-    ).join('\n');
-
-    const booksSummary = allBooks.map(b =>
-      `- ID:${b.id} | Name:"${b.name}" | Balance:${b.balance} BDT | Org: "${b.organization?.name || 'Unknown'}"`
-    ).join('\n');
-
-    const txnSummary = recentTxns.map(t =>
-      `- ${t.dateTime?.toISOString?.().split('T')[0] || ''}: ${t.type} of ${t.amount} BDT | Category:"${t.category}" | Note:"${t.note || ''}"`
-    ).join('\n');
-
-    const systemPrompt = `You are Hisab Pata AI — a Bangladeshi personal finance assistant.
-
-=== PROMPT DIRECTORY & ROUTING ===
-Identify the user's intent and follow the matching guidelines below:
-1. For general chat/help: Follow [## SECTION A: GENERAL GUIDELINES]
-2. For adding/recording transactions: Follow [## SECTION B: TRANSACTION CREATION]
-3. For balance, category, or trend summaries: Follow [## SECTION C: FINANCIAL ANALYSIS & REPORTS]
-4. For custom UI rendering: Follow [## SECTION D: CUSTOM DATA CARDS FORMATTING]
-=================================
-
-## SECTION A: GENERAL GUIDELINES
-- NEVER use markdown, asterisks, quotes, or special characters. Plain text ONLY.
-- Respond in MAX 2-3 sentences for regular answers. Short and direct.
-- Always respond in the same language the user writes in (typically Bangla or English).
-- NEVER say "recorded" or "added" for transactions in text response. Say "ready for your approval" (or approval er jonno ready).
-- USER INFO: Name: ${userData?.name || 'User'} | Email: ${userData?.email || 'Unknown'}
-- USER'S ORGANIZATIONS: ${orgSummary || 'None'}
-- USER'S BOOKS: ${booksSummary || 'None'}
-- RECENT TRANSACTIONS: ${txnSummary || 'None'}
-
-## SECTION B: TRANSACTION CREATION
-1. First check if all required details are present:
-   - Amount (the numerical value of the transaction, e.g. 500 BDT)
-   - Target Book (must clearly correspond to one of USER'S BOOKS by ID or name; ask user to clarify/select if ambiguous or unspecified)
-2. If any of the required details above is missing, incomplete, or ambiguous:
-   - DO NOT output the '[DATA type:transactions]' block.
-   - DO NOT output any action blocks.
-   - Instead, reply to the user asking them politely to specify the missing information (e.g., "কত টাকা খরচ হয়েছে?" or "কোন হিসাব খাতায় এটি যোগ করব?"). Do NOT perform entry creation until these are clear.
-3. ONLY when all details are fully specified:
-   - Parse the description and break into multiple logical transactions if needed.
-   - Show them in a '[DATA type:transactions]' block (refer to Section D for format).
-   - Include the action block for EACH transaction at the end.
-   - Ask user to confirm.
-
-## SECTION C: FINANCIAL ANALYSIS & REPORTS
-- When user asks for insights, summaries, balances, or breakdowns, analyze the user's books and recent transactions.
-- Keep the textual analysis short (max 1-2 lines) and always pair it with the corresponding custom UI data card from Section D.
-
-## SECTION D: CUSTOM DATA CARDS FORMATTING
-The app contains custom code to render beautiful cards/tables when you output structured DATA blocks. To display premium widgets, append the appropriate DATA block at the end of your response:
-
-1. Balance Summary Card:
-[DATA type:balance]
-[{"book":"Personal","balance":15000,"org":"Personal"},{"book":"Office","balance":30000,"org":"Dhaka Office"}]
-[/DATA]
-
-2. Category Spending Card:
-[DATA type:category]
-[{"category":"Food","amount":5000,"count":12},{"category":"Transport","amount":2000,"count":8}]
-[/DATA]
-
-3. Proposed Transactions List Card:
-[DATA type:transactions]
-[{"note":"Rickshaw from Mugda","amount":50,"type":"expense","category":"Transport"},{"note":"Breakfast","amount":120,"type":"expense","category":"Food"}]
-[/DATA]
-
-Action block format (MULTIPLE allowed, one per transaction):
-\`\`\`action
-{
-  "action": "create_transaction",
-  "data": {
-    "bookId": "<book_id>",
-    "type": "income" or "expense",
-    "amount": <number>,
-    "category": "<category>",
-    "note": "<note>",
-    "dateTime": "<ISO date string>",
-    "contact": "<name or phone (optional)>",
-    "recipientUserId": "<user_id if sending money>",
-    "orgFundId": "<fund_id if applicable>"
-  }
-}
-\`\`\`
-
-For bug/complaint:
-\`\`\`action
-{
-  "action": "create_complaint",
-  "data": {
-    "subject": "<short title>",
-    "message": "<details>",
-    "category": "Bug" or "Feature Request" or "Account Issue" or "Other"
-  }
-}
-\`\`\`
-
-## STRICT RULES:
-1. For summaries/balances — use DATA block. Text response max 1 line.
-2. For creating transactions — use action blocks. Can have MULTIPLE blocks.
-3. Categories: খাবার, যাতায়াত, বাজার, বিল, বেতন, ব্যবসা, দান, শিক্ষা, চিকিৎসা, বিনোদন
-4. Use today: ${new Date().toISOString().split('T')[0]}
-5. Output PLAIN TEXT only. No symbols, no formatting chars (no asterisks, no quotes).`;
+    const agentCtx = await prepareAiAgentRequest(req.user.id, bookId, messages);
+    const { systemPrompt, contextBookId, intent, recommendedTemperature } = agentCtx;
+    const llmMessages = truncateAiMessagesForLlm(messages);
 
     // ── Set up SSE ──
     res.setHeader('Content-Type', 'text/event-stream');
@@ -4979,15 +5861,50 @@ For bug/complaint:
       res.write(`data: ${JSON.stringify({ type, ...data })}\n\n`);
     };
 
-    const tempVal = temperature != null ? parseFloat(temperature) : 0.7;
-    const maxTokVal = maxTokens != null ? parseInt(maxTokens) : 2048;
+    const deterministic = await tryDeterministicAiResponse(messages, agentCtx, req.user.id);
+    if (deterministic.handled) {
+      await saveAiChatTurn({
+        userId: req.user.id,
+        userMessage: getLastUserMessage(messages),
+        assistantMessage: deterministic.cleanResponse,
+        bookId: contextBookId,
+        model,
+        provider,
+        intent,
+      });
+      sendEvent('clean', { response: deterministic.cleanResponse });
+      if (deterministic.proposedActions?.length) {
+        sendEvent('actions', { actions: deterministic.proposedActions });
+      }
+      sendEvent('done', {});
+      return res.end();
+    }
+
+    const offTopic = tryOffTopicAiResponse(messages, agentCtx);
+    if (offTopic.handled) {
+      await saveAiChatTurn({
+        userId: req.user.id,
+        userMessage: getLastUserMessage(messages),
+        assistantMessage: offTopic.cleanResponse,
+        bookId: contextBookId,
+        model,
+        provider,
+        intent: 'off_topic',
+      });
+      sendEvent('clean', { response: offTopic.cleanResponse });
+      sendEvent('done', {});
+      return res.end();
+    }
+
+    const tempVal = temperature != null ? parseFloat(temperature) : recommendedTemperature;
+    const maxTokVal = resolveAiMaxTokens(maxTokens);
 
     if (provider === 'gemini') {
       const url = baseUrl
         ? `${baseUrl}/v1beta/models/${model}:streamGenerateContent?alt=sse&key=${apiKey}`
         : `https://generativelanguage.googleapis.com/v1beta/models/${model}:streamGenerateContent?alt=sse&key=${apiKey}`;
 
-      const contents = messages.map(m => ({
+      const contents = llmMessages.map(m => ({
         role: m.role === 'user' ? 'user' : 'model',
         parts: [{ text: m.content }]
       }));
@@ -5036,57 +5953,13 @@ For bug/complaint:
         }
       }
 
-      // Parse any action blocks from the full response
-      const actionBlockRegex = /```action\s*([\s\S]*?)```/g;
-      const matches = [...fullText.matchAll(actionBlockRegex)];
-      const cleanResponse = fullText.replace(actionBlockRegex, '').trim();
-      const proposedActions = [];
-
-      for (const match of matches) {
-        try {
-          const actionData = JSON.parse(match[1].trim());
-          if (actionData.action === 'create_transaction' && actionData.data) {
-            const { bookId: txnBookId, type, amount, category, note, dateTime, contact, recipientUserId, orgFundId } = actionData.data;
-            const book = await prisma.book.findFirst({
-              where: { id: txnBookId || contextBookId },
-              include: { organization: { include: { members: { where: { userId: req.user.id } } } } }
-            });
-            if (book && book.organization.members.length > 0) {
-              proposedActions.push({
-                action: 'create_transaction',
-                data: {
-                  bookId: book.id, bookName: book.name, orgName: book.organization?.name,
-                  type, amount: parseFloat(amount), category: category || 'General',
-                  note: note || '', dateTime: dateTime ? new Date(dateTime) : new Date().toISOString(),
-                  contact: contact || '', recipientUserId: recipientUserId || null, orgFundId: orgFundId || null,
-                },
-                valid: true,
-              });
-            }
-          }
-          if (actionData.action === 'create_complaint' && actionData.data) {
-            const { subject, message, category } = actionData.data;
-            if (subject && message) {
-              try {
-                const complaint = await prisma.complaint.create({
-                  data: { userId: req.user.id, subject, message, category: category || 'Other' },
-                });
-                sendEvent('auto_action', { action: 'create_complaint', subject, id: complaint.id });
-              } catch (err) { /* skip */ }
-            }
-          }
-        } catch (e) { /* skip parse errors */ }
-      }
-
-      if (proposedActions.length > 0) {
-        sendEvent('actions', { actions: proposedActions });
-      }
+      await emitAiStreamFinal(sendEvent, fullText, agentCtx, req.user.id, messages, { model, provider });
 
     } else if (provider === 'openai') {
       const url = baseUrl ? `${baseUrl}/v1/chat/completions` : 'https://api.openai.com/v1/chat/completions';
       const formattedMessages = [
         { role: 'system', content: systemPrompt },
-        ...messages.map(m => ({ role: m.role, content: m.content }))
+        ...llmMessages.map(m => ({ role: m.role, content: m.content }))
       ];
 
       const openaiRes = await fetch(url, {
@@ -5140,46 +6013,7 @@ For bug/complaint:
         }
       }
 
-      // Parse actions (same as gemini)
-      const actionBlockRegex = /```action\s*([\s\S]*?)```/g;
-      const matches = [...fullText.matchAll(actionBlockRegex)];
-      const proposedActions = [];
-      for (const match of matches) {
-        try {
-          const actionData = JSON.parse(match[1].trim());
-          if (actionData.action === 'create_transaction' && actionData.data) {
-            const { bookId: txnBookId, type, amount, category, note, dateTime, contact, recipientUserId, orgFundId } = actionData.data;
-            const book = await prisma.book.findFirst({
-              where: { id: txnBookId || contextBookId },
-              include: { organization: { include: { members: { where: { userId: req.user.id } } } } }
-            });
-            if (book && book.organization.members.length > 0) {
-              proposedActions.push({
-                action: 'create_transaction',
-                data: {
-                  bookId: book.id, bookName: book.name, orgName: book.organization?.name,
-                  type, amount: parseFloat(amount), category: category || 'General',
-                  note: note || '', dateTime: dateTime ? new Date(dateTime) : new Date().toISOString(),
-                  contact: contact || '', recipientUserId: recipientUserId || null, orgFundId: orgFundId || null,
-                },
-                valid: true,
-              });
-            }
-          }
-          if (actionData.action === 'create_complaint' && actionData.data) {
-            const { subject, message, category } = actionData.data;
-            if (subject && message) {
-              const complaint = await prisma.complaint.create({
-                data: { userId: req.user.id, subject, message, category: category || 'Other' },
-              });
-              sendEvent('auto_action', { action: 'create_complaint', subject, id: complaint.id });
-            }
-          }
-        } catch (e) { /* skip */ }
-      }
-      if (proposedActions.length > 0) {
-        sendEvent('actions', { actions: proposedActions });
-      }
+      await emitAiStreamFinal(sendEvent, fullText, agentCtx, req.user.id, messages, { model, provider });
 
     } else if (provider === 'claude') {
       const url = baseUrl ? `${baseUrl}/v1/messages` : 'https://api.anthropic.com/v1/messages';
@@ -5195,7 +6029,7 @@ For bug/complaint:
           max_tokens: maxTokVal,
           temperature: tempVal,
           system: systemPrompt,
-          messages: messages.map(m => ({ role: m.role, content: m.content })),
+          messages: llmMessages.map(m => ({ role: m.role, content: m.content })),
           stream: true
         })
       });
@@ -5233,46 +6067,7 @@ For bug/complaint:
         }
       }
 
-      // Parse actions (same as above)
-      const actionBlockRegex = /```action\s*([\s\S]*?)```/g;
-      const matches = [...fullText.matchAll(actionBlockRegex)];
-      const proposedActions = [];
-      for (const match of matches) {
-        try {
-          const actionData = JSON.parse(match[1].trim());
-          if (actionData.action === 'create_transaction' && actionData.data) {
-            const { bookId: txnBookId, type, amount, category, note, dateTime, contact, recipientUserId, orgFundId } = actionData.data;
-            const book = await prisma.book.findFirst({
-              where: { id: txnBookId || contextBookId },
-              include: { organization: { include: { members: { where: { userId: req.user.id } } } } }
-            });
-            if (book && book.organization.members.length > 0) {
-              proposedActions.push({
-                action: 'create_transaction',
-                data: {
-                  bookId: book.id, bookName: book.name, orgName: book.organization?.name,
-                  type, amount: parseFloat(amount), category: category || 'General',
-                  note: note || '', dateTime: dateTime ? new Date(dateTime) : new Date().toISOString(),
-                  contact: contact || '', recipientUserId: recipientUserId || null, orgFundId: orgFundId || null,
-                },
-                valid: true,
-              });
-            }
-          }
-          if (actionData.action === 'create_complaint' && actionData.data) {
-            const { subject, message, category } = actionData.data;
-            if (subject && message) {
-              const complaint = await prisma.complaint.create({
-                data: { userId: req.user.id, subject, message, category: category || 'Other' },
-              });
-              sendEvent('auto_action', { action: 'create_complaint', subject, id: complaint.id });
-            }
-          }
-        } catch (e) { /* skip */ }
-      }
-      if (proposedActions.length > 0) {
-        sendEvent('actions', { actions: proposedActions });
-      }
+      await emitAiStreamFinal(sendEvent, fullText, agentCtx, req.user.id, messages, { model, provider });
 
     } else {
       sendEvent('error', { message: `Unsupported provider: ${provider}` });
@@ -5421,7 +6216,8 @@ app.post('/api/ai/execute', authenticateToken, async (req, res) => {
     }
 
     if (action === 'create_transaction') {
-      const { bookId, type, amount, category, note, dateTime, contact, recipientUserId, orgFundId } = data;
+      const { bookId, type, amount, category, note, description, dateTime, contact, recipientUserId, orgFundId } = data;
+      const resolvedNote = (note || description || '').trim();
 
       if (!bookId || !type || !amount) {
         return res.status(400).json({ error: 'Missing required transaction fields' });
@@ -5453,7 +6249,7 @@ app.post('/api/ai/execute', authenticateToken, async (req, res) => {
         type,
         amount: parsedAmount,
         category: category || 'General',
-        note: note || '',
+        note: resolvedNote,
         contact: contact || null,
         recipientUserId: recipientUserId || null,
         orgFundId: orgFundId || null,
@@ -5588,6 +6384,24 @@ app.get('/api/admin/users', authenticateAdmin, async (req, res) => {
     res.json(users);
   } catch (error) {
     console.error('[Admin] Failed to fetch users:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.get('/api/admin/ai-chats', authenticateAdmin, async (req, res) => {
+  try {
+    const limit = Math.min(parseInt(req.query.limit, 10) || 100, 500);
+    const userId = req.query.userId;
+    const where = userId ? { userId } : {};
+    const messages = await prisma.aiChatMessage.findMany({
+      where,
+      include: { user: { select: { id: true, name: true, email: true, phoneNumber: true } } },
+      orderBy: { createdAt: 'desc' },
+      take: limit,
+    });
+    res.json(messages);
+  } catch (error) {
+    console.error('[Admin] Failed to fetch AI chats:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });

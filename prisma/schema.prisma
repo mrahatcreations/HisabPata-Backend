@@ -16,9 +16,26 @@ model User {
   tokenVersion Int                  @default(0)
   avatarUrl    String?
   isAdmin      Boolean              @default(false)
+  aiConfig     Json?
+  aiChatMessages AiChatMessage[]
   memberships  OrganizationMember[]
   complaints   Complaint[]
   createdAt    DateTime             @default(now())
+}
+
+model AiChatMessage {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  role      String
+  content   String
+  bookId    String?
+  model     String?
+  provider  String?
+  intent    String?
+  createdAt DateTime @default(now())
+
+  @@index([userId, createdAt])
 }
 
 model Complaint {
