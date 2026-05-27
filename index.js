@@ -15,42 +15,41 @@ const fs = require('fs');
 require('dotenv').config();
 const { Readable } = require('stream');
 
-const useSeafile = !!process.env.SEAFILE_URL;
-const seafileUrl = process.env.SEAFILE_URL ? process.env.SEAFILE_URL.replace(/\/$/, '') : '';
-const seafileToken = process.env.SEAFILE_TOKEN;
-const seafileRepo = process.env.SEAFILE_REPO_ID;
-const seafileDir = process.env.SEAFILE_DIR || '/';
+// ─── SeaweedFS Storage ────────────────────────────────────────────────────────
+// Set SEAWEEDFS_MASTER=http://your-server:9333 in .env to enable.
+// If not set, files are stored locally in /uploads as fallback.
+const seaweedMaster = process.env.SEAWEEDFS_MASTER ? process.env.SEAWEEDFS_MASTER.replace(/\/$/, '') : '';
+const useSeaweed = !!seaweedMaster;
 
-async function uploadToSeafile(localPath, filename) {
-  if (!useSeafile) return;
+// Upload a local file to SeaweedFS. Returns the public URL to store in DB.
+async function uploadToSeaweed(localPath, filename) {
+  if (!useSeaweed) return null;
   try {
-    const linkRes = await fetch(`${seafileUrl}/api2/repos/${seafileRepo}/upload-link/?p=${seafileDir}`, {
-      headers: { 'Authorization': `Token ${seafileToken}` }
-    });
-    if (!linkRes.ok) throw new Error('Failed to get Seafile upload link: ' + await linkRes.text());
-    
-    const uploadLink = (await linkRes.text()).replace(/"/g, '').trim();
-    
+    // Step 1: Ask master for an upload URL + fid
+    const assignRes = await fetch(`${seaweedMaster}/dir/assign`);
+    if (!assignRes.ok) throw new Error('SeaweedFS assign failed: ' + await assignRes.text());
+    const { fid, url } = await assignRes.json();
+
+    // Step 2: Upload file to the volume server
     const formData = new FormData();
-    formData.append('parent_dir', seafileDir);
-    formData.append('filename', filename);
     const fileBuffer = fs.readFileSync(localPath);
     const blob = new Blob([fileBuffer]);
     formData.append('file', blob, filename);
-    
-    const res = await fetch(uploadLink, {
+
+    const uploadRes = await fetch(`http://${url}/${fid}`, {
       method: 'POST',
-      headers: { 'Authorization': `Token ${seafileToken}` },
       body: formData
     });
-    
-    if (res.ok) {
-      try { fs.unlinkSync(localPath); } catch (e) {}
-    } else {
-      console.error('Seafile upload error:', await res.text());
-    }
+    if (!uploadRes.ok) throw new Error('SeaweedFS upload failed: ' + await uploadRes.text());
+
+    // Delete local temp file after successful upload
+    try { fs.unlinkSync(localPath); } catch (e) {}
+
+    // Return the fid as the stored reference (we'll proxy via /uploads/:fid)
+    return fid;
   } catch (error) {
-    console.error('Failed to upload to Seafile:', error);
+    console.error('[SeaweedFS] Upload error:', error);
+    return null;
   }
 }
 
@@ -138,22 +137,26 @@ app.use(cors({
   credentials: !isCorsWildcard,
 }));
 app.use(express.json());
-if (useSeafile) {
-  app.get('/uploads/:filename', async (req, res, next) => {
+// SeaweedFS proxy: /uploads/:fid → streams file from volume server
+if (useSeaweed) {
+  app.get('/uploads/:fid', async (req, res, next) => {
     try {
-      const dlRes = await fetch(`${seafileUrl}/api2/repos/${seafileRepo}/file/?p=${seafileDir}/${req.params.filename}`, {
-        headers: { 'Authorization': `Token ${seafileToken}` }
-      });
-      if (!dlRes.ok) return next();
-      const dlLink = (await dlRes.text()).replace(/"/g, '').trim();
-      
-      const fileRes = await fetch(dlLink);
+      // Ask master for the volume URL for this fid
+      const lookupRes = await fetch(`${seaweedMaster}/dir/lookup?volumeId=${req.params.fid.split(',')[0]}`);
+      if (!lookupRes.ok) return next();
+      const lookupData = await lookupRes.json();
+      const locations = lookupData.locations;
+      if (!locations || locations.length === 0) return next();
+      const volumeUrl = locations[0].publicUrl || locations[0].url;
+
+      const fileRes = await fetch(`http://${volumeUrl}/${req.params.fid}`);
       if (!fileRes.ok) return next();
-      
+
       const ct = fileRes.headers.get('content-type');
       const cl = fileRes.headers.get('content-length');
       if (ct) res.setHeader('Content-Type', ct);
       if (cl) res.setHeader('Content-Length', cl);
+      res.setHeader('Cache-Control', 'public, max-age=31536000');
       Readable.fromWeb(fileRes.body).pipe(res);
     } catch (e) {
       next();
@@ -235,10 +238,11 @@ app.post('/api/upload', authenticateToken, (req, res) => {
       return res.status(400).json({ error: 'No file uploaded' });
     }
 
-    uploadToSeafile(req.file.path, req.file.filename);
-
-    // Return relative URL path
-    const fileUrl = `/uploads/${req.file.filename}`;
+    let fileUrl = `/uploads/${req.file.filename}`;
+    if (useSeaweed) {
+      const fid = await uploadToSeaweed(req.file.path, req.file.filename);
+      if (fid) fileUrl = `/uploads/${fid}`;
+    }
     res.json({ imageUrl: fileUrl });
   });
 });
@@ -3985,7 +3989,12 @@ app.post('/api/audio-notes/upload', authenticateToken, upload.single('audio'), a
       console.error('Gemini API Error:', await aiRes.text());
     }
 
-    const audioUrl = `/uploads/${req.file.filename}`;
+    let audioUrl = `/uploads/${req.file.filename}`;
+    if (useSeaweed) {
+      const fid = await uploadToSeaweed(req.file.path, req.file.filename);
+      if (fid) audioUrl = `/uploads/${fid}`;
+    }
+
     const note = await prisma.audioNote.create({
       data: {
         userId: user.id,
@@ -3995,7 +4004,7 @@ app.post('/api/audio-notes/upload', authenticateToken, upload.single('audio'), a
         recordedAt: new Date(req.body.recordedAt || Date.now()),
       }
     });
-    
+
     res.status(201).json(note);
   } catch (err) {
     console.error('Error processing audio note:', err);
