@@ -15,40 +15,45 @@ const fs = require('fs');
 require('dotenv').config();
 const { Readable } = require('stream');
 
-// ─── SeaweedFS Storage ────────────────────────────────────────────────────────
-// Set SEAWEEDFS_MASTER=http://your-server:9333 in .env to enable.
+// ─── SeaweedFS Filer Storage ───────────────────────────────────────────────
+// Set SEAWEEDFS_FILER=http://your-server:8888 in .env to enable.
+// Files will be stored in organized folders under /hisabpata/ on Filer.
 // If not set, files are stored locally in /uploads as fallback.
-const seaweedMaster = process.env.SEAWEEDFS_MASTER ? process.env.SEAWEEDFS_MASTER.replace(/\/$/, '') : '';
-const useSeaweed = !!seaweedMaster;
+const seaweedFiler = process.env.SEAWEEDFS_FILER ? process.env.SEAWEEDFS_FILER.replace(/\/$/, '') : '';
+const useSeaweed = !!seaweedFiler;
+const seaweedAppDir = process.env.SEAWEEDFS_DIR || 'hisabpata';
 
-// Upload a local file to SeaweedFS. Returns the public URL to store in DB.
-async function uploadToSeaweed(localPath, filename) {
+// Determine folder category from MIME type or file extension
+function getSeaweedFolder(mimetype, filename) {
+  if (!mimetype) mimetype = '';
+  if (mimetype.startsWith('audio/') || /\.(m4a|mp3|wav|aac|ogg|opus)$/i.test(filename)) return 'audio';
+  if (mimetype.startsWith('video/') || /\.(mp4|mov|avi|mkv)$/i.test(filename)) return 'video';
+  if (mimetype.startsWith('image/') || /\.(jpg|jpeg|png|gif|webp)$/i.test(filename)) return 'images';
+  return 'files';
+}
+
+// Upload a local file to SeaweedFS Filer. Returns the stored path to save in DB.
+async function uploadToSeaweed(localPath, filename, mimetype) {
   if (!useSeaweed) return null;
   try {
-    // Step 1: Ask master for an upload URL + fid
-    const assignRes = await fetch(`${seaweedMaster}/dir/assign`);
-    if (!assignRes.ok) throw new Error('SeaweedFS assign failed: ' + await assignRes.text());
-    const { fid, url } = await assignRes.json();
+    const folder = getSeaweedFolder(mimetype, filename);
+    const filerPath = `/${seaweedAppDir}/${folder}/${filename}`;
 
-    // Step 2: Upload file to the volume server
-    const formData = new FormData();
     const fileBuffer = fs.readFileSync(localPath);
-    const blob = new Blob([fileBuffer]);
-    formData.append('file', blob, filename);
-
-    const uploadRes = await fetch(`http://${url}/${fid}`, {
-      method: 'POST',
-      body: formData
+    const uploadRes = await fetch(`${seaweedFiler}${filerPath}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': mimetype || 'application/octet-stream' },
+      body: fileBuffer
     });
-    if (!uploadRes.ok) throw new Error('SeaweedFS upload failed: ' + await uploadRes.text());
+    if (!uploadRes.ok) throw new Error('Filer upload failed: ' + await uploadRes.text());
 
     // Delete local temp file after successful upload
     try { fs.unlinkSync(localPath); } catch (e) {}
 
-    // Return the fid as the stored reference (we'll proxy via /uploads/:fid)
-    return fid;
+    // Return relative path — used in DB and as proxy URL key
+    return `${folder}/${filename}`;
   } catch (error) {
-    console.error('[SeaweedFS] Upload error:', error);
+    console.error('[SeaweedFS Filer] Upload error:', error);
     return null;
   }
 }
@@ -137,19 +142,12 @@ app.use(cors({
   credentials: !isCorsWildcard,
 }));
 app.use(express.json());
-// SeaweedFS proxy: /uploads/:fid → streams file from volume server
+// SeaweedFS Filer proxy: /uploads/category/filename → streams from Filer
 if (useSeaweed) {
-  app.get('/uploads/:fid', async (req, res, next) => {
+  app.get('/uploads/:category/:filename', async (req, res, next) => {
     try {
-      // Ask master for the volume URL for this fid
-      const lookupRes = await fetch(`${seaweedMaster}/dir/lookup?volumeId=${req.params.fid.split(',')[0]}`);
-      if (!lookupRes.ok) return next();
-      const lookupData = await lookupRes.json();
-      const locations = lookupData.locations;
-      if (!locations || locations.length === 0) return next();
-      const volumeUrl = locations[0].publicUrl || locations[0].url;
-
-      const fileRes = await fetch(`http://${volumeUrl}/${req.params.fid}`);
+      const filerPath = `/${seaweedAppDir}/${req.params.category}/${req.params.filename}`;
+      const fileRes = await fetch(`${seaweedFiler}${filerPath}`);
       if (!fileRes.ok) return next();
 
       const ct = fileRes.headers.get('content-type');
@@ -240,8 +238,8 @@ app.post('/api/upload', authenticateToken, (req, res) => {
 
     let fileUrl = `/uploads/${req.file.filename}`;
     if (useSeaweed) {
-      const fid = await uploadToSeaweed(req.file.path, req.file.filename);
-      if (fid) fileUrl = `/uploads/${fid}`;
+      const storedPath = await uploadToSeaweed(req.file.path, req.file.filename, req.file.mimetype);
+      if (storedPath) fileUrl = `/uploads/${storedPath}`;
     }
     res.json({ imageUrl: fileUrl });
   });
@@ -3991,8 +3989,8 @@ app.post('/api/audio-notes/upload', authenticateToken, upload.single('audio'), a
 
     let audioUrl = `/uploads/${req.file.filename}`;
     if (useSeaweed) {
-      const fid = await uploadToSeaweed(req.file.path, req.file.filename);
-      if (fid) audioUrl = `/uploads/${fid}`;
+      const storedPath = await uploadToSeaweed(req.file.path, req.file.filename, req.file.mimetype);
+      if (storedPath) audioUrl = `/uploads/${storedPath}`;
     }
 
     const note = await prisma.audioNote.create({
