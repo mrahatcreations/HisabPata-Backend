@@ -1845,6 +1845,93 @@ app.post('/api/transactions/:id/modify', authenticateToken, async (req, res) => 
   }
 });
 
+// --- CHECK TRANSACTION DELETE STATUS (counterparty existence) ---
+app.get('/api/transactions/:id/delete-info', authenticateToken, async (req, res) => {
+  try {
+    const txnId = req.params.id;
+    const txn = await prisma.transaction.findUnique({ where: { id: txnId } });
+    if (!txn) return res.status(404).json({ error: 'Transaction not found' });
+
+    const book = await prisma.book.findUnique({ where: { id: txn.bookId } });
+    if (!book) return res.status(404).json({ error: 'Book not found' });
+
+    const result = {
+      hasCounterparty: false,
+      counterpartyExists: false,
+      counterpartyType: null,
+      counterpartyName: null,
+      needsApproval: false,
+    };
+
+    // Check linkedTransactionId (paired income/expense)
+    if (txn.linkedTransactionId) {
+      result.hasCounterparty = true;
+      const linkedTxn = await prisma.transaction.findUnique({ where: { id: txn.linkedTransactionId } });
+      if (linkedTxn) {
+        const linkedBook = await prisma.book.findUnique({ where: { id: linkedTxn.bookId } });
+        if (linkedBook) {
+          result.counterpartyExists = true;
+          result.counterpartyType = 'book';
+          result.counterpartyName = linkedBook.name;
+          // Need approval from other side
+          result.needsApproval = txn.reconStatus === 'approved';
+        }
+      }
+    }
+
+    // Check recipientOrgId (org-to-org send)
+    if (txn.recipientOrgId) {
+      result.hasCounterparty = true;
+      const recipientOrg = await prisma.organization.findUnique({ where: { id: txn.recipientOrgId } });
+      if (recipientOrg) {
+        result.counterpartyExists = true;
+        result.counterpartyType = 'org';
+        result.counterpartyName = recipientOrg.name;
+        result.needsApproval = txn.reconStatus === 'approved';
+      }
+    }
+
+    // Check orgFundId (fund transfer source)
+    if (txn.orgFundId) {
+      result.hasCounterparty = true;
+      const fundBook = await prisma.book.findUnique({ where: { id: txn.orgFundId } });
+      if (fundBook) {
+        result.counterpartyExists = true;
+        result.counterpartyType = 'fund';
+        result.counterpartyName = fundBook.name;
+        result.needsApproval = txn.reconStatus === 'approved';
+      }
+    }
+
+    // Check recipientUserId (for personal recipient books)
+    if (txn.recipientUserId && !txn.recipientOrgId) {
+      result.hasCounterparty = true;
+      const recipientUser = await prisma.user.findUnique({ where: { id: txn.recipientUserId } });
+      if (recipientUser) {
+        // Check if the recipient user has any active personal book
+        const userPersonalBooks = await prisma.book.findMany({
+          where: {
+            organization: { isPersonal: true },
+            organization: { members: { some: { userId: txn.recipientUserId } } }
+          },
+          take: 1
+        });
+        if (userPersonalBooks.length > 0) {
+          result.counterpartyExists = true;
+          result.counterpartyType = 'user';
+          result.counterpartyName = recipientUser.name;
+          result.needsApproval = txn.reconStatus === 'approved';
+        }
+      }
+    }
+
+    return res.json(result);
+  } catch (error) {
+    console.error('Delete info error:', error);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
 // --- DELETE TRANSACTION ---
 app.delete('/api/transactions/:id', authenticateToken, async (req, res) => {
   try {
@@ -3739,7 +3826,31 @@ app.delete('/api/org/:orgId', authenticateToken, async (req, res) => {
       select: { id: true }
     });
     const bookIds = orgBooks.map(b => b.id);
+
+    // Collect IDs of transactions being deleted (for cleaning up linkedTransactionId)
+    const deletingTxnIds = (await prisma.transaction.findMany({
+      where: { bookId: { in: bookIds } },
+      select: { id: true }
+    })).map(t => t.id);
+
+    // Clean up orphaned references in other books' transactions
     await prisma.$transaction([
+      // Clear recipientOrgId in transactions that were sent TO this org
+      prisma.transaction.updateMany({
+        where: { recipientOrgId: req.params.orgId },
+        data: { recipientOrgId: null }
+      }),
+      // Clear orgFundId in transactions that used this org's books as fund source
+      prisma.transaction.updateMany({
+        where: { orgFundId: { in: bookIds } },
+        data: { orgFundId: null }
+      }),
+      // Clear linkedTransactionId pointing to deleted transactions
+      prisma.transaction.updateMany({
+        where: { linkedTransactionId: { in: deletingTxnIds } },
+        data: { linkedTransactionId: null }
+      }),
+      // Delete org's own members, transactions, and books
       prisma.organizationMember.deleteMany({ where: { organizationId: req.params.orgId } }),
       prisma.transaction.deleteMany({ where: { bookId: { in: bookIds } } }),
       prisma.book.deleteMany({ where: { organizationId: req.params.orgId } }),
