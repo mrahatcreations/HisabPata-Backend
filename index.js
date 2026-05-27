@@ -219,22 +219,40 @@ const hasAdminOrEditorAccess = async (orgId, userId) => {
   return checkPermission(orgId, userId, 'edit_all');
 };
 
-// Check if a user bypasses org approval based on role/permissions (admins and editors bypass)
+// Real orgs never auto-approve on create/retry — permission holders approve manually in Approval Center.
+// Personal org only: internal personal-book flows skip org queue.
 const checkApprovalBypass = async (orgId, userId) => {
-  const [org, membership] = await Promise.all([
-    prisma.organization.findUnique({ where: { id: orgId }, select: { isPersonal: true } }),
-    prisma.organizationMember.findUnique({
-      where: { userId_organizationId: { userId, organizationId: orgId } }
-    })
-  ]);
-  if (!org || org.isPersonal) return true; // Personal orgs always bypass
-  if (!membership || membership.status !== 'active') return false;
-
-  // Admins and Editors (has edit_all permission or editor role) bypass approval
-  if (membership.role === 'admin' || membership.role === 'editor' || (membership.permissions || []).includes('edit_all')) {
-    return true;
-  }
+  const org = await prisma.organization.findUnique({
+    where: { id: orgId },
+    select: { isPersonal: true }
+  });
+  if (!org || org.isPersonal) return true;
   return false;
+};
+
+// Which org's approval policy applies (fund org for cross-book vouchers, else book's org)
+const resolveApprovalOrgId = async (txn, book) => {
+  if (txn.orgFundId) {
+    const fundBook = await prisma.book.findUnique({
+      where: { id: txn.orgFundId },
+      select: { id: true, organizationId: true }
+    });
+    if (fundBook && fundBook.id !== book.id) {
+      return fundBook.organizationId;
+    }
+    const fundTxn = await prisma.transaction.findUnique({
+      where: { id: txn.orgFundId },
+      select: { bookId: true }
+    });
+    if (fundTxn) {
+      const fundTxnBook = await prisma.book.findUnique({
+        where: { id: fundTxn.bookId },
+        select: { organizationId: true }
+      });
+      if (fundTxnBook) return fundTxnBook.organizationId;
+    }
+  }
+  return book.organizationId;
 };
 
 // Calculate remaining balance of an org fund advance (for chain split / deficit)
@@ -265,6 +283,147 @@ const getOrgAdminUserIds = async (orgId) => {
   return admins.map(a => a.userId);
 };
 
+const CREATOR_PERSONAL_MIRROR_SUFFIX = '_cpm';
+
+const getUserPersonalBook = async (userId, txClient = prisma) => {
+  const membership = await txClient.organizationMember.findFirst({
+    where: { userId, status: 'active', organization: { isPersonal: true } },
+    include: { organization: { include: { books: { where: { isDefault: true }, take: 1 } } } }
+  });
+  return membership?.organization?.books?.[0] || null;
+};
+
+const findCreatorPersonalMirror = async (orgTxn, txClient = prisma) => {
+  if (!orgTxn?.clientRef) return null;
+  return txClient.transaction.findFirst({
+    where: { clientRef: orgTxn.clientRef + CREATOR_PERSONAL_MIRROR_SUFFIX }
+  });
+};
+
+const createCreatorPersonalMirror = async (tx, {
+  orgTxn,
+  orgBook,
+  creatorPersonalBook,
+  userId,
+  txnClientRef,
+  mirrorType
+}) => {
+  if (!creatorPersonalBook || creatorPersonalBook.id === orgBook.id) return null;
+
+  const type = mirrorType || orgTxn.type;
+  const orgLabel = orgBook.name || 'org';
+  const note = type === 'income'
+    ? (orgTxn.note ? `${orgTxn.note} [${orgLabel}]` : `[${orgLabel}]`)
+    : (orgTxn.note ? `${orgTxn.note} [${orgLabel}]` : `[${orgLabel}]`);
+
+  const mirror = await tx.transaction.create({
+    data: {
+      bookId: creatorPersonalBook.id,
+      amount: orgTxn.amount,
+      type,
+      note,
+      category: orgTxn.category,
+      contact: orgTxn.contact,
+      recipientUserId: orgTxn.recipientUserId || null,
+      recipientOrgId: orgTxn.recipientOrgId || null,
+      orgFundId: orgBook.id,
+      createdById: userId,
+      reconStatus: orgTxn.reconStatus,
+      imageUrl: orgTxn.imageUrl,
+      clientRef: txnClientRef + CREATOR_PERSONAL_MIRROR_SUFFIX,
+      chainId: orgTxn.chainId || null,
+      chainType: orgTxn.chainType || null
+    }
+  });
+
+  const balanceOp = type === 'income' ? { increment: orgTxn.amount } : { decrement: orgTxn.amount };
+  await tx.book.update({ where: { id: creatorPersonalBook.id }, data: { balance: balanceOp } });
+  return mirror;
+};
+
+const maybeMirrorOrgTxnToCreatorPersonal = async (tx, {
+  orgTxn,
+  orgBook,
+  userId,
+  txnClientRef,
+  mirrorType,
+  skipMirror = false
+}) => {
+  if (skipMirror || orgTxn.type !== 'expense' || orgBook.organization?.isPersonal) return null;
+  if (!(await hasAdminOrEditorAccess(orgBook.organizationId, userId))) return null;
+  const personalBook = await getUserPersonalBook(userId, tx);
+  if (!personalBook) return null;
+  return createCreatorPersonalMirror(tx, {
+    orgTxn,
+    orgBook,
+    creatorPersonalBook: personalBook,
+    userId,
+    txnClientRef,
+    mirrorType
+  });
+};
+
+const syncCreatorPersonalMirrorStatus = async (tx, orgTxn, status, historyEntry, extraData = {}) => {
+  const mirror = await findCreatorPersonalMirror(orgTxn, tx);
+  if (!mirror) return;
+  const cur = await tx.transaction.findUnique({
+    where: { id: mirror.id },
+    select: { version: true, updateHistory: true }
+  });
+  if (!cur) return;
+  const data = {
+    reconStatus: status,
+    version: { increment: 1 },
+    ...extraData
+  };
+  if (historyEntry) {
+    data.updateHistory = [...(cur.updateHistory || []), historyEntry];
+  }
+  await tx.transaction.updateMany({
+    where: { id: mirror.id, version: cur.version },
+    data
+  });
+};
+
+const rejectCreatorPersonalMirror = async (tx, orgTxn, rejectHistoryEntry) => {
+  const mirror = await findCreatorPersonalMirror(orgTxn, tx);
+  if (!mirror || mirror.reconStatus === 'rejected') return;
+  const cur = await tx.transaction.findUnique({
+    where: { id: mirror.id },
+    select: { version: true, updateHistory: true }
+  });
+  if (!cur) return;
+  await tx.transaction.updateMany({
+    where: { id: mirror.id, version: cur.version },
+    data: {
+      reconStatus: 'rejected',
+      version: { increment: 1 },
+      updateHistory: [...(cur.updateHistory || []), rejectHistoryEntry]
+    }
+  });
+  const balanceAdj = mirror.type === 'expense' ? mirror.amount : -mirror.amount;
+  await tx.book.update({
+    where: { id: mirror.bookId },
+    data: { balance: { increment: balanceAdj } }
+  });
+};
+
+const resolveOrgSourceTxnForMirror = async (txn, txClient = prisma) => {
+  const isRealOrgBook = async (bookId) => {
+    const b = await txClient.book.findUnique({
+      where: { id: bookId },
+      include: { organization: { select: { isPersonal: true } } }
+    });
+    return b && !b.organization.isPersonal;
+  };
+  if (txn.type === 'expense' && await isRealOrgBook(txn.bookId)) return txn;
+  if (txn.linkedTransactionId) {
+    const linked = await txClient.transaction.findUnique({ where: { id: txn.linkedTransactionId } });
+    if (linked?.type === 'expense' && await isRealOrgBook(linked.bookId)) return linked;
+  }
+  return null;
+};
+
 // Find mirror transaction in parent book for sub-book sync
 const findMirrorTxn = async (txn, book) => {
   if (!book.parentBookId) return null;
@@ -290,6 +449,151 @@ const findMirrorTxn = async (txn, book) => {
 // Generate a UUID-like chain ID
 const generateChainId = () => {
   return 'chain_' + Date.now().toString(36) + '_' + Math.random().toString(36).substring(2, 10);
+};
+
+// All transactions in a personal Send + org-fund triple entry (chainType fund_send)
+const getFundSendChain = async (txn, txClient = prisma) => {
+  if (txn.chainType === 'fund_send' && txn.chainId) {
+    return txClient.transaction.findMany({ where: { chainId: txn.chainId } });
+  }
+  return null;
+};
+
+const syncFundSendChainStatus = async (tx, txn, status, historyEntry, extraData = {}) => {
+  const chain = await getFundSendChain(txn, tx);
+  if (!chain) return false;
+  for (const t of chain) {
+    const cur = await tx.transaction.findUnique({
+      where: { id: t.id },
+      select: { version: true, updateHistory: true }
+    });
+    if (!cur) throw new Error('Chain transaction not found');
+    const data = {
+      reconStatus: status,
+      version: { increment: 1 },
+      ...extraData
+    };
+    if (historyEntry) {
+      data.updateHistory = [...(cur.updateHistory || []), historyEntry];
+    }
+    const upd = await tx.transaction.updateMany({
+      where: { id: t.id, version: cur.version },
+      data
+    });
+    if (upd.count === 0) throw new Error(`Concurrency conflict on fund_send chain ${t.id}`);
+  }
+  return true;
+};
+
+const rejectFundSendChain = async (tx, txn, rejectHistoryEntry) => {
+  const chain = await getFundSendChain(txn, tx);
+  if (!chain) return false;
+  for (const ct of chain) {
+    if (ct.reconStatus === 'rejected') continue;
+    const cur = await tx.transaction.findUnique({
+      where: { id: ct.id },
+      select: { version: true, updateHistory: true }
+    });
+    if (!cur) throw new Error('Chain transaction not found');
+    const upd = await tx.transaction.updateMany({
+      where: { id: ct.id, version: cur.version },
+      data: {
+        reconStatus: 'rejected',
+        pendingAction: null,
+        pendingData: null,
+        counterProposedAmount: null,
+        counterProposedBy: null,
+        version: { increment: 1 },
+        updateHistory: [...(cur.updateHistory || []), rejectHistoryEntry]
+      }
+    });
+    if (upd.count === 0) throw new Error('Concurrency conflict on fund_send reject');
+    const balanceAdj = ct.type === 'expense' ? ct.amount : -ct.amount;
+    await tx.book.update({
+      where: { id: ct.bookId },
+      data: { balance: { increment: balanceAdj } }
+    });
+  }
+  return true;
+};
+
+const resolveFundSendChainParts = (chain) => {
+  const recipientTxn = chain.find(t => t.type === 'income');
+  const fundOrgTxn = chain.find(t => t.type === 'expense' && t.bookId === t.orgFundId);
+  const personalTxn = chain.find(t => t.type === 'expense' && t.id !== fundOrgTxn?.id);
+  return { personalTxn, fundOrgTxn, recipientTxn };
+};
+
+const updateFundSendTxnStatus = async (tx, t, status, historyEntry, extraData = {}) => {
+  const cur = await tx.transaction.findUnique({
+    where: { id: t.id },
+    select: { version: true, updateHistory: true }
+  });
+  if (!cur) throw new Error('Chain transaction not found');
+  const data = {
+    reconStatus: status,
+    version: { increment: 1 },
+    ...extraData
+  };
+  if (historyEntry) {
+    data.updateHistory = [...(cur.updateHistory || []), historyEntry];
+  }
+  const upd = await tx.transaction.updateMany({
+    where: { id: t.id, version: cur.version },
+    data
+  });
+  if (upd.count === 0) throw new Error(`Concurrency conflict on fund_send update ${t.id}`);
+};
+
+// Org approved on fund_send — recipient may have already accepted (parallel flow)
+const approveFundSendOrg = async (tx, txn, approveHistoryEntry) => {
+  const chain = await getFundSendChain(txn, tx);
+  if (!chain) return null;
+  const { personalTxn, fundOrgTxn, recipientTxn } = resolveFundSendChainParts(chain);
+  const clearCounter = { counterProposedAmount: null, counterProposedBy: null };
+
+  if (recipientTxn?.reconStatus === 'pending_org') {
+    for (const t of chain) {
+      await updateFundSendTxnStatus(tx, t, 'approved', approveHistoryEntry, clearCounter);
+    }
+    return { final: true };
+  }
+
+  for (const t of [personalTxn, fundOrgTxn, recipientTxn]) {
+    if (!t) continue;
+    await updateFundSendTxnStatus(tx, t, 'pending_recipient', approveHistoryEntry, clearCounter);
+  }
+  return { final: false };
+};
+
+// Recipient accepted on fund_send — org may still be pending (parallel flow)
+const approveFundSendRecipient = async (tx, txn, approveHistoryEntry) => {
+  const chain = await getFundSendChain(txn, tx);
+  if (!chain) return null;
+  const { personalTxn, fundOrgTxn, recipientTxn } = resolveFundSendChainParts(chain);
+  const clearCounter = { counterProposedAmount: null, counterProposedBy: null };
+  const orgStillPending =
+    personalTxn?.reconStatus === 'pending_org' || fundOrgTxn?.reconStatus === 'pending_org';
+
+  if (orgStillPending && recipientTxn) {
+    await updateFundSendTxnStatus(tx, recipientTxn, 'pending_org', approveHistoryEntry, clearCounter);
+    return { final: false };
+  }
+
+  for (const t of chain) {
+    await updateFundSendTxnStatus(tx, t, 'approved', approveHistoryEntry, clearCounter);
+  }
+  return { final: true };
+};
+
+const fundSendRetryStatuses = (bypassOrgApproval, isSelfSend) => {
+  if (isSelfSend && bypassOrgApproval) {
+    return { personal: 'approved', fundOrg: 'approved', recipient: 'approved' };
+  }
+  if (bypassOrgApproval) {
+    return { personal: 'pending_recipient', fundOrg: 'pending_recipient', recipient: 'pending_recipient' };
+  }
+  return { personal: 'pending_org', fundOrg: 'pending_org', recipient: 'pending_recipient' };
 };
 
 // Optimistic-locking update: only succeeds if version matches, then increments it.
@@ -695,6 +999,7 @@ app.get('/api/users/search', authenticateToken, async (req, res) => {
 
     const users = await prisma.user.findMany({
       where: {
+        id: { not: req.user.id },
         OR: [
           { name: { contains: q, mode: 'insensitive' } },
           { phoneNumber: { endsWith: q.slice(-10) } },
@@ -1003,6 +1308,19 @@ app.post('/api/transactions', authenticateToken, async (req, res) => {
       return res.status(403).json({ error: 'Not authorized to use this book' });
     }
 
+    if (!book.organization.isPersonal && !(await hasAdminOrEditorAccess(book.organizationId, req.user.id))) {
+      return res.status(403).json({
+        error: 'Members must record org expenses from their personal book with an org fund selected'
+      });
+    }
+
+    // Org book: Send-only for expense. Other categories → personal book + org fund.
+    if (!book.organization.isPersonal && type === 'expense' && category !== 'Send') {
+      return res.status(400).json({
+        error: 'Organization books only support Send for expenses. Use your personal book with this organization as fund for other categories.'
+      });
+    }
+
     // --- ORG-TO-ORG SEND FLOW (expense with category "Send" + recipientOrgId) ---
     if (isOrgSend) {
       const recipientBook = await prisma.book.findFirst({
@@ -1056,6 +1374,12 @@ app.post('/api/transactions', authenticateToken, async (req, res) => {
         await prisma.book.update({ where: { id: recipientBook.id }, data: { balance: { increment: parsedAmount } } });
         await prisma.transaction.update({ where: { id: sourceTxn.id }, data: { linkedTransactionId: recipientTxn.id } });
         await prisma.transaction.update({ where: { id: recipientTxn.id }, data: { linkedTransactionId: sourceTxn.id } });
+        await maybeMirrorOrgTxnToCreatorPersonal(prisma, {
+          orgTxn: sourceTxn,
+          orgBook: book,
+          userId: req.user.id,
+          txnClientRef
+        });
         return sourceTxn;
       });
 
@@ -1074,6 +1398,154 @@ app.post('/api/transactions', authenticateToken, async (req, res) => {
       return res.status(201).json({ transaction: enriched, isHandshake: true, approvalBypassed: bypassSourceOrgApproval && bypassRecipientOrgApproval });
     }
 
+    // --- PERSONAL FUNDED SEND (personal book + Send + org fund book + recipient) ---
+    if (isSend && book.organization.isPersonal && orgFundId && (recipientUserId || recipientOrgId)) {
+      const fundBook = await prisma.book.findUnique({
+        where: { id: orgFundId },
+        include: { organization: { select: { isPersonal: true, id: true } } }
+      });
+      const isFundOrgBook = fundBook && !fundBook.organization.isPersonal && fundBook.id !== bookId;
+
+      if (isFundOrgBook) {
+        let recipientBook = null;
+        if (recipientUserId) {
+          const recipientMembership = await prisma.organizationMember.findFirst({
+            where: { userId: recipientUserId, organization: { isPersonal: true } },
+            include: { organization: { include: { books: { where: { isDefault: true } } } } }
+          });
+          if (!recipientMembership || recipientMembership.organization.books.length === 0) {
+            return res.status(400).json({ error: 'Recipient has no personal book' });
+          }
+          recipientBook = recipientMembership.organization.books[0];
+        } else {
+          recipientBook = await prisma.book.findFirst({
+            where: { organizationId: recipientOrgId, isDefault: true }
+          });
+          if (!recipientBook) {
+            return res.status(400).json({ error: 'Recipient organization has no default book' });
+          }
+        }
+
+        const bypassFundOrgApproval = await checkApprovalBypass(fundBook.organizationId, req.user.id);
+        const isSelfSend = recipientUserId === req.user.id;
+        const retryStatuses = fundSendRetryStatuses(bypassFundOrgApproval, isSelfSend);
+        const personalStatus = retryStatuses.personal;
+        const fundOrgStatus = retryStatuses.fundOrg;
+        const recipientStatus = retryStatuses.recipient;
+
+        const chainId = generateChainId();
+        const chainType = 'fund_send';
+
+        const result = await prisma.$transaction(async (prisma) => {
+          const personalTxn = await prisma.transaction.create({
+            data: {
+              bookId,
+              amount: parsedAmount,
+              type: 'expense',
+              note: note || '',
+              category: 'Send',
+              contact,
+              recipientUserId: recipientUserId || null,
+              recipientOrgId: recipientOrgId || null,
+              orgFundId: fundBook.id,
+              createdById: req.user.id,
+              reconStatus: personalStatus,
+              imageUrl,
+              chainId,
+              chainType,
+              clientRef: txnClientRef
+            }
+          });
+
+          const fundOrgTxn = await prisma.transaction.create({
+            data: {
+              bookId: fundBook.id,
+              amount: parsedAmount,
+              type: 'expense',
+              note: note ? `${note} (fund send)` : 'Fund send',
+              category: 'Send',
+              contact,
+              recipientUserId: recipientUserId || null,
+              recipientOrgId: recipientOrgId || null,
+              orgFundId: fundBook.id,
+              createdById: req.user.id,
+              reconStatus: fundOrgStatus,
+              imageUrl,
+              chainId,
+              chainType,
+              clientRef: txnClientRef,
+              linkedTransactionId: personalTxn.id
+            }
+          });
+
+          const recipientTxn = await prisma.transaction.create({
+            data: {
+              bookId: recipientBook.id,
+              amount: parsedAmount,
+              type: 'income',
+              note: recipientUserId
+                ? `Org fund send: ${note || ''}`
+                : `Org fund transfer: ${note || ''}`,
+              category: 'Send',
+              contact,
+              recipientUserId: recipientUserId ? req.user.id : null,
+              recipientOrgId: recipientOrgId ? fundBook.organizationId : null,
+              orgFundId: fundBook.id,
+              createdById: req.user.id,
+              reconStatus: recipientStatus,
+              imageUrl,
+              chainId,
+              chainType,
+              clientRef: txnClientRef
+            }
+          });
+
+          await prisma.book.update({ where: { id: bookId }, data: { balance: { decrement: parsedAmount } } });
+          await prisma.book.update({ where: { id: fundBook.id }, data: { balance: { decrement: parsedAmount } } });
+          await prisma.book.update({ where: { id: recipientBook.id }, data: { balance: { increment: parsedAmount } } });
+
+          await prisma.transaction.update({
+            where: { id: personalTxn.id },
+            data: { linkedTransactionId: recipientTxn.id }
+          });
+          await prisma.transaction.update({
+            where: { id: recipientTxn.id },
+            data: { linkedTransactionId: personalTxn.id }
+          });
+
+          return personalTxn;
+        });
+
+        broadcast({ type: 'data_changed' });
+        const enriched = await enrichTxn(result);
+
+        if (recipientStatus === 'pending_recipient' && !isSelfSend) {
+          if (recipientUserId) {
+            broadcastToUser(recipientUserId, { type: 'pending_send_received', transaction: enriched });
+          } else if (recipientOrgId) {
+            const recipientAdmins = await prisma.organizationMember.findMany({
+              where: {
+                organizationId: recipientOrgId,
+                status: 'active',
+                OR: [{ role: 'admin' }, { permissions: { has: 'edit_all' } }]
+              },
+              select: { userId: true }
+            });
+            broadcastToUsers(recipientAdmins.map(a => a.userId), {
+              type: 'pending_send_received',
+              transaction: enriched
+            });
+          }
+        }
+
+        return res.status(201).json({
+          transaction: enriched,
+          isHandshake: true,
+          approvalBypassed: bypassFundOrgApproval
+        });
+      }
+    }
+
     // --- DISBURSEMENT FLOW (expense with category "Send" + recipientUserId) ---
     if (isSend && recipientUserId) {
       const recipientMembership = await prisma.organizationMember.findFirst({
@@ -1086,7 +1558,7 @@ app.post('/api/transactions', authenticateToken, async (req, res) => {
       const recipientBook = recipientMembership.organization.books[0];
 
       // Determine initial state based on org approval policy
-      const bypassOrgApproval = await checkApprovalBypass(book.organizationId, req.user.id);
+      let bypassOrgApproval = await checkApprovalBypass(book.organizationId, req.user.id);
       const isSelfSend = recipientUserId === req.user.id;
       const initialStatus = (isSelfSend && bypassOrgApproval) ? 'approved' : (bypassOrgApproval ? 'pending_recipient' : 'pending_org');
 
@@ -1132,6 +1604,13 @@ app.post('/api/transactions', authenticateToken, async (req, res) => {
         await prisma.book.update({ where: { id: recipientBook.id }, data: { balance: { increment: parsedAmount } } });
         await prisma.transaction.update({ where: { id: sourceTxn.id }, data: { linkedTransactionId: recipientTxn.id } });
         await prisma.transaction.update({ where: { id: recipientTxn.id }, data: { linkedTransactionId: sourceTxn.id } });
+        await maybeMirrorOrgTxnToCreatorPersonal(prisma, {
+          orgTxn: sourceTxn,
+          orgBook: book,
+          userId: req.user.id,
+          txnClientRef,
+          skipMirror: isSelfSend
+        });
         return sourceTxn;
       });
 
@@ -1264,50 +1743,64 @@ app.post('/api/transactions', authenticateToken, async (req, res) => {
     }
 
     // Mirror to parent book if this is a sub-book
-    let mirrorTransaction = null;
     if (book.parentBookId) {
       const mirrorBalanceOp = type === 'income' ? { increment: parsedAmount } : { decrement: parsedAmount };
-      mirrorTransaction = prisma.transaction.create({
-        data: {
-          bookId: book.parentBookId,
-          amount: parsedAmount,
-          type,
-          note: note ? (note + ' [' + book.name + ']') : ('[' + book.name + ']'),
-          category,
-          contact,
-          createdById: req.user.id,
-          reconStatus: initialStatus,
-          imageUrl,
-          sourceSubBookId: bookId,
-          clientRef: txnClientRef
-        }
-      });
-      const allOps = [
-        prisma.transaction.create({
+      const transactionResult = await prisma.$transaction(async (tx) => {
+        const createdTxn = await tx.transaction.create({
           data: {
             bookId,
             amount: parsedAmount, type, note, category, contact,
             createdById: req.user.id, reconStatus: initialStatus, imageUrl, clientRef: txnClientRef
           }
-        }),
-        prisma.book.update({ where: { id: bookId }, data: { balance: balanceOp } }),
-        prisma.book.update({ where: { id: book.parentBookId }, data: { balance: mirrorBalanceOp } }),
-        mirrorTransaction,
-      ];
-      const [transaction, , , _mirror] = await prisma.$transaction(allOps);
+        });
+        await tx.book.update({ where: { id: bookId }, data: { balance: balanceOp } });
+        await tx.book.update({ where: { id: book.parentBookId }, data: { balance: mirrorBalanceOp } });
+        await tx.transaction.create({
+          data: {
+            bookId: book.parentBookId,
+            amount: parsedAmount,
+            type,
+            note: note ? (note + ' [' + book.name + ']') : ('[' + book.name + ']'),
+            category,
+            contact,
+            createdById: req.user.id,
+            reconStatus: initialStatus,
+            imageUrl,
+            sourceSubBookId: bookId,
+            clientRef: txnClientRef
+          }
+        });
+        await maybeMirrorOrgTxnToCreatorPersonal(tx, {
+          orgTxn: createdTxn,
+          orgBook: book,
+          userId: req.user.id,
+          txnClientRef
+        });
+        return createdTxn;
+      });
       broadcast({ type: "data_changed" });
-      const enriched = await enrichTxn(transaction);
+      const enriched = await enrichTxn(transactionResult);
       return res.status(201).json({ transaction: enriched, book: await prisma.book.findUnique({ where: { id: bookId } }), mirrorBook: await prisma.book.findUnique({ where: { id: book.parentBookId } }) });
     }
 
-    const [transaction, updatedBook] = await prisma.$transaction([
-      prisma.transaction.create({ data: { bookId, amount: parsedAmount, type, note, category, contact, createdById: req.user.id, reconStatus: initialStatus, imageUrl, clientRef: txnClientRef } }),
-      prisma.book.update({ where: { id: bookId }, data: { balance: balanceOp } })
-    ]);
+    const createResult = await prisma.$transaction(async (tx) => {
+      const transaction = await tx.transaction.create({
+        data: { bookId, amount: parsedAmount, type, note, category, contact, createdById: req.user.id, reconStatus: initialStatus, imageUrl, clientRef: txnClientRef }
+      });
+      await tx.book.update({ where: { id: bookId }, data: { balance: balanceOp } });
+      await maybeMirrorOrgTxnToCreatorPersonal(tx, {
+        orgTxn: transaction,
+        orgBook: book,
+        userId: req.user.id,
+        txnClientRef
+      });
+      const updatedBook = await tx.book.findUnique({ where: { id: bookId } });
+      return { transaction, updatedBook };
+    });
 
     broadcast({ type: "data_changed" });
-    const enriched = await enrichTxn(transaction);
-    res.status(201).json({ transaction: enriched, book: updatedBook });
+    const enriched = await enrichTxn(createResult.transaction);
+    res.status(201).json({ transaction: enriched, book: createResult.updatedBook });
   } catch (error) {
     console.error('Create transaction error:', error);
     res.status(500).json({ error: 'Server error creating transaction' });
@@ -1317,17 +1810,25 @@ app.post('/api/transactions', authenticateToken, async (req, res) => {
 // --- EDIT TRANSACTION ---
 app.put('/api/transactions/:id', authenticateToken, async (req, res) => {
   try {
-    const { amount, type, note, category, contact, recipientUserId, imageUrl } = req.body;
+    const { amount, type, note, category, contact, recipientUserId, imageUrl, orgFundId } = req.body;
     const txnId = req.params.id;
 
     const txn = await prisma.transaction.findUnique({ where: { id: txnId } });
     if (!txn) return res.status(404).json({ error: 'Transaction not found' });
 
-    const book = await prisma.book.findUnique({ where: { id: txn.bookId } });
+    const book = await prisma.book.findUnique({ where: { id: txn.bookId }, include: { organization: { select: { isPersonal: true } } } });
     if (!book) return res.status(404).json({ error: 'Book not found' });
 
     if (!(await hasAdminOrEditorAccess(book.organizationId, req.user.id))) {
       return res.status(403).json({ error: 'Only admins or editors can edit transactions' });
+    }
+
+    const finalType = type !== undefined ? type : txn.type;
+    const finalCategory = category !== undefined ? category : txn.category;
+    if (!book.organization.isPersonal && finalType === 'expense' && finalCategory !== 'Send') {
+      return res.status(400).json({
+        error: 'Organization books only support Send for expenses. Use your personal book with this organization as fund for other categories.'
+      });
     }
 
     const changes = {};
@@ -1342,6 +1843,15 @@ app.put('/api/transactions/:id', authenticateToken, async (req, res) => {
     if (contact !== undefined) changes.contact = contact;
     if (recipientUserId !== undefined) changes.recipientUserId = recipientUserId;
     if (imageUrl !== undefined) changes.imageUrl = imageUrl;
+    if (orgFundId !== undefined) {
+      if (orgFundId === null || orgFundId === '') {
+        changes.orgFundId = null;
+      } else {
+        const fundBook = await prisma.book.findUnique({ where: { id: orgFundId } });
+        if (!fundBook) return res.status(400).json({ error: 'Invalid fund source' });
+        changes.orgFundId = orgFundId;
+      }
+    }
 
     if (Object.keys(changes).length === 0) return res.status(400).json({ error: 'No fields to update' });
 
@@ -1362,9 +1872,13 @@ app.put('/api/transactions/:id', authenticateToken, async (req, res) => {
     const editOrg = await prisma.organization.findUnique({ where: { id: book.organizationId }, select: { isPersonal: true } });
     const isManualIncome = txn.type === 'income' && !txn.linkedTransactionId;
     if (editOrg?.isPersonal || isManualIncome) {
-      // Personal book or manual income: direct update, balance adjusted, no approval needed
+      // Personal book or manual income: direct update; skip balance adj on rejected (reject already restored)
       let personalBalAdj = 0;
-      if (changes.amount !== undefined && changes.amount !== txn.amount) {
+      if (
+        txn.reconStatus !== 'rejected' &&
+        changes.amount !== undefined &&
+        changes.amount !== txn.amount
+      ) {
         if (txn.type === 'expense') personalBalAdj = txn.amount - parsedAmount;
         else if (txn.type === 'income') personalBalAdj = parsedAmount - txn.amount;
       }
@@ -2545,13 +3059,23 @@ app.post('/api/transactions/:id/action', authenticateToken, async (req, res) => 
 
       // --- PENDING_ORG → advance to next stage ---
       if (txn.reconStatus === 'pending_org') {
+        if (txn.chainType === 'fund_send' && txn.type === 'income') {
+          return res.status(400).json({ error: 'Fund organization must approve the send first' });
+        }
+
         const isSend = txn.category === 'Send' && txn.linkedTransactionId;
         if (isSend || (txn.category === 'Send' && (txn.recipientUserId || txn.recipientOrgId))) {
           const isSelfSend = txn.recipientUserId === txn.createdById;
           const nextStatus = isSelfSend ? 'approved' : 'pending_recipient';
 
-          // Send: advance both linked txns with version lock
+          // Send: advance fund_send chain (parallel org + recipient) or linked pair
+          let fundSendOrgResult = null;
           await prisma.$transaction(async (tx) => {
+            if (txn.chainType === 'fund_send' && txn.chainId) {
+              fundSendOrgResult = await approveFundSendOrg(tx, txn, approveHistoryEntry);
+              return;
+            }
+
             const main = await tx.transaction.findUnique({ where: { id: txnId }, select: { version: true, updateHistory: true } });
             if (!main) throw new Error('Transaction not found');
             const upd1 = await tx.transaction.updateMany({
@@ -2578,7 +3102,21 @@ app.post('/api/transactions/:id/action', authenticateToken, async (req, res) => 
                 if (upd2.count === 0) throw new Error('Concurrency conflict on linked pending_org advance');
               }
             }
+
+            const orgSource = await resolveOrgSourceTxnForMirror(txn, tx);
+            if (orgSource && orgSource.chainType !== 'fund_send') {
+              await syncCreatorPersonalMirrorStatus(tx, orgSource, nextStatus, approveHistoryEntry);
+            }
           });
+
+          if (fundSendOrgResult?.final) {
+            broadcast({ type: 'data_changed' });
+            return res.json({ message: 'Org approved, transaction completed' });
+          }
+          if (fundSendOrgResult && !fundSendOrgResult.final) {
+            broadcast({ type: 'data_changed' });
+            return res.json({ message: 'Org approved, waiting for recipient acceptance' });
+          }
 
           // Notify recipient that org approval passed
           if (txn.recipientUserId && !isSelfSend) {
@@ -2632,19 +3170,30 @@ app.post('/api/transactions/:id/action', authenticateToken, async (req, res) => 
           }
 
           // General expense/voucher: approve directly with version lock
-          const updated = await updateTxnWithVersion(txnId, txn.version, {
-            reconStatus: 'approved',
-            updateHistory: [...(txn.updateHistory || []), approveHistoryEntry]
+          const updated = await prisma.$transaction(async (tx) => {
+            const approvedTxn = await updateTxnWithVersion(txnId, txn.version, {
+              reconStatus: 'approved',
+              updateHistory: [...(txn.updateHistory || []), approveHistoryEntry]
+            }, tx);
+            const orgSource = await resolveOrgSourceTxnForMirror(txn, tx);
+            if (orgSource) {
+              await syncCreatorPersonalMirrorStatus(tx, orgSource, 'approved', approveHistoryEntry);
+            }
+            return approvedTxn;
           });
-          broadcast({ type: "data_changed" });
+          broadcast({ type: 'data_changed' });
           return res.json({ transaction: updated, message: 'Transaction approved' });
         }
       }
 
       // --- PENDING_RECIPIENT → approve (green) ---
       if (txn.reconStatus === 'pending_recipient') {
+        let fundSendRecipientResult = null;
         await prisma.$transaction(async (tx) => {
-          const main = await tx.transaction.findUnique({ where: { id: txnId }, select: { version: true, updateHistory: true } });
+          if (txn.chainType === 'fund_send' && txn.chainId) {
+            fundSendRecipientResult = await approveFundSendRecipient(tx, txn, approveHistoryEntry);
+          } else {
+            const main = await tx.transaction.findUnique({ where: { id: txnId }, select: { version: true, updateHistory: true } });
           if (!main) throw new Error('Transaction not found');
           const upd1 = await tx.transaction.updateMany({
             where: { id: txnId, version: main.version },
@@ -2721,10 +3270,26 @@ app.post('/api/transactions/:id/action', authenticateToken, async (req, res) => 
               }
             }
           }
+
+          const orgSource = await resolveOrgSourceTxnForMirror(txn, tx);
+          if (orgSource && orgSource.chainType !== 'fund_send') {
+            const mirrorStatus =
+              fundSendRecipientResult && !fundSendRecipientResult.final ? 'pending_org' : 'approved';
+            await syncCreatorPersonalMirrorStatus(tx, orgSource, mirrorStatus, approveHistoryEntry, {
+              counterProposedAmount: null,
+              counterProposedBy: null
+            });
+          }
+          }
         });
 
+        if (fundSendRecipientResult && !fundSendRecipientResult.final) {
+          broadcast({ type: 'data_changed' });
+          return res.json({ message: 'Accepted, waiting for organization approval' });
+        }
+
         // Broadcast deficit adjustment notification outside txn (non-critical)
-        if (txn.type === 'income') {
+        if (txn.type === 'income' && (fundSendRecipientResult?.final !== false)) {
           const deficits = await prisma.transaction.findMany({
             where: {
               chainType: 'deficit',
@@ -2860,6 +3425,15 @@ app.post('/api/transactions/:id/action', authenticateToken, async (req, res) => 
         reversedBalance -= txn.amount;
       }
 
+      // fund_send: reject entire chain atomically
+      if (txn.chainType === 'fund_send' && txn.chainId) {
+        await prisma.$transaction(async (tx) => {
+          await rejectFundSendChain(tx, txn, rejectHistoryEntry);
+        });
+        broadcast({ type: 'data_changed' });
+        return res.json({ message: 'Fund send rejected' });
+      }
+
       // ── Atomic reject with linked transaction rollback ──
       await prisma.$transaction(async (tx) => {
         // Version-locked reject of main transaction
@@ -2931,6 +3505,11 @@ app.post('/api/transactions/:id/action', authenticateToken, async (req, res) => 
             }
           }
         }
+
+        const orgSource = await resolveOrgSourceTxnForMirror(txn, tx);
+        if (orgSource && orgSource.chainType !== 'fund_send') {
+          await rejectCreatorPersonalMirror(tx, orgSource, rejectHistoryEntry);
+        }
       });
 
       // Broadcast liability notification if applicable
@@ -2965,31 +3544,65 @@ app.post('/api/transactions/:id/retry', authenticateToken, async (req, res) => {
     const book = await prisma.book.findUnique({ where: { id: txn.bookId }, include: { organization: true } });
     if (!book) return res.status(404).json({ error: 'Book not found' });
 
-    // Determine the correct initial reconStatus based on current org policy
-    const bypassOrgApproval = await checkApprovalBypass(book.organizationId, req.user.id);
+    const approvalOrgId = await resolveApprovalOrgId(txn, book);
+    const bypassOrgApproval = await checkApprovalBypass(approvalOrgId, req.user.id);
     const isSend = txn.category === 'Send';
     const newStatus = isSend
       ? (bypassOrgApproval ? 'pending_recipient' : 'pending_org')
       : (bypassOrgApproval ? 'approved' : 'pending_org');
 
     const updated = await prisma.$transaction(async (tx) => {
-      // Version-locked retry: set retried status + increment version
       const main = await tx.transaction.findUnique({ where: { id: txnId }, select: { version: true } });
       if (!main) throw new Error('Transaction not found');
-      const upd = await tx.transaction.updateMany({
-        where: { id: txnId, version: main.version },
-        data: {
-          reconStatus: newStatus,
-          pendingAction: null,
-          pendingData: null,
-          counterProposedAmount: null,
-          counterProposedBy: null,
-          version: { increment: 1 }
-        }
-      });
-      if (upd.count === 0) throw new Error('Concurrency conflict on retry');
 
-      // If linked transaction exists, also reset it to the same status
+      if (txn.chainType === 'fund_send' && txn.chainId) {
+        const chainTxns = await tx.transaction.findMany({ where: { chainId: txn.chainId } });
+        const { personalTxn, fundOrgTxn, recipientTxn } = resolveFundSendChainParts(chainTxns);
+        const isSelfSend = personalTxn?.recipientUserId === personalTxn?.createdById;
+        const statuses = fundSendRetryStatuses(bypassOrgApproval, isSelfSend);
+
+        for (const ct of chainTxns) {
+          const targetStatus =
+            ct.id === recipientTxn?.id ? statuses.recipient
+            : ct.id === fundOrgTxn?.id ? statuses.fundOrg
+            : statuses.personal;
+          const cur = await tx.transaction.findUnique({ where: { id: ct.id }, select: { version: true } });
+          const updC = await tx.transaction.updateMany({
+            where: { id: ct.id, version: cur.version },
+            data: {
+              reconStatus: targetStatus,
+              pendingAction: null,
+              pendingData: null,
+              counterProposedAmount: null,
+              counterProposedBy: null,
+              isLiability: false,
+              version: { increment: 1 }
+            }
+          });
+          if (updC.count === 0) throw new Error('Concurrency conflict on fund_send retry');
+        }
+
+        for (const ct of chainTxns) {
+          const balanceDelta = ct.type === 'expense' ? -ct.amount : ct.amount;
+          await tx.book.update({
+            where: { id: ct.bookId },
+            data: { balance: { increment: balanceDelta } }
+          });
+        }
+      } else {
+        const upd = await tx.transaction.updateMany({
+          where: { id: txnId, version: main.version },
+          data: {
+            reconStatus: newStatus,
+            pendingAction: null,
+            pendingData: null,
+            counterProposedAmount: null,
+            counterProposedBy: null,
+            version: { increment: 1 }
+          }
+        });
+        if (upd.count === 0) throw new Error('Concurrency conflict on retry');
+
       if (txn.linkedTransactionId) {
         const linked = await tx.transaction.findUnique({ where: { id: txn.linkedTransactionId }, select: { version: true } });
         if (linked) {
@@ -3007,15 +3620,58 @@ app.post('/api/transactions/:id/retry', authenticateToken, async (req, res) => {
           });
           if (updL.count === 0) throw new Error('Concurrency conflict on linked retry');
         }
+
+        if (isSend) {
+          const balanceDelta = txn.type === 'expense' ? -txn.amount : txn.amount;
+          await tx.book.update({
+            where: { id: txn.bookId },
+            data: { balance: { increment: balanceDelta } }
+          });
+          const linkedFull = await tx.transaction.findUnique({ where: { id: txn.linkedTransactionId } });
+          if (linkedFull) {
+            const linkedBalanceDelta = linkedFull.type === 'income' ? linkedFull.amount : -linkedFull.amount;
+            await tx.book.update({
+              where: { id: linkedFull.bookId },
+              data: { balance: { increment: linkedBalanceDelta } }
+            });
+          }
+        }
+      }
       }
 
-      // If bypass approval, re-apply balance (reject reversed it, approve needs it back)
-      if (!isSend && bypassOrgApproval) {
+      // Re-apply balance (reject had reversed it) for non-send expenses
+      if (!isSend) {
         const balanceDelta = txn.type === 'expense' ? -txn.amount : txn.amount;
         await tx.book.update({
           where: { id: txn.bookId },
           data: { balance: { increment: balanceDelta } }
         });
+
+        // Bypass on fund org: mirror expense into org book (same as create voucher flow)
+        if (bypassOrgApproval && newStatus === 'approved' && txn.orgFundId) {
+          const targetBook = await tx.book.findUnique({ where: { id: txn.orgFundId } });
+          if (targetBook && targetBook.id !== txn.bookId) {
+            await tx.book.update({
+              where: { id: targetBook.id },
+              data: { balance: { decrement: txn.amount } }
+            });
+            await tx.transaction.create({
+              data: {
+                bookId: targetBook.id,
+                amount: txn.amount,
+                type: 'expense',
+                note: txn.note || '',
+                category: txn.category || 'Voucher',
+                contact: txn.contact,
+                orgFundId: targetBook.id,
+                createdById: txn.createdById,
+                reconStatus: 'approved',
+                clientRef: txn.clientRef,
+                imageUrl: txn.imageUrl
+              }
+            });
+          }
+        }
       }
 
       return tx.transaction.findUnique({ where: { id: txnId } });
