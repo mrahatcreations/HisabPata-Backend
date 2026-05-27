@@ -1743,10 +1743,25 @@ app.delete('/api/books/:bookId', authenticateToken, async (req, res) => {
 // Create Transaction (supports org fund handshake for "Send" category and book-based vouchers)
 app.post('/api/transactions', authenticateToken, async (req, res) => {
   try {
-    const { bookId, amount, type, note, category, contact, recipientUserId, recipientOrgId, orgFundId, imageUrl, clientRef } = req.body;
+    const { bookId, amount, type, note, category, contact, recipientUserId, recipientOrgId, orgFundId, imageUrl, clientRef, audioNoteId } = req.body;
 
     if (!bookId || !amount || !type) {
       return res.status(400).json({ error: 'BookId, amount, and type are required' });
+    }
+
+    if (audioNoteId) {
+      res.on('finish', async () => {
+        if (res.statusCode === 201) {
+          try {
+            await prisma.audioNote.update({
+              where: { id: audioNoteId },
+              data: { status: 'completed' }
+            });
+          } catch (e) {
+            console.error('Failed to mark audio note as completed:', e);
+          }
+        }
+      });
     }
 
     const parsedAmount = parseFloat(amount);
@@ -5158,8 +5173,17 @@ const prepareAiAgentRequest = async (userId, bookId, messages) => {
     where: { userId, status: 'pending' },
     orderBy: { recordedAt: 'asc' }
   });
+  const audioNotesPayload = pendingAudioNotes.map(n => ({
+    id: n.id,
+    audioUrl: n.audioUrl || '',
+    text: n.text || 'Unclear audio',
+    recordedAt: new Date(n.recordedAt).toISOString()
+  }));
+  const audioNotesDataBlock = pendingAudioNotes.length > 0 
+    ? `[DATA type:audio_notes] ${JSON.stringify(audioNotesPayload)} [/DATA]`
+    : 'None';
   const audioNotesSummary = pendingAudioNotes.length > 0
-    ? pendingAudioNotes.map(n => `- [${new Date(n.recordedAt).toLocaleTimeString()}] ${n.text || "Unclear audio"}`).join('\n')
+    ? pendingAudioNotes.map(n => `- ID:${n.id} [${new Date(n.recordedAt).toLocaleTimeString()}] ${n.text || "Unclear audio"}`).join('\n')
     : 'None';
 
   const userData = await prisma.user.findUnique({ where: { id: userId } });
@@ -5228,7 +5252,8 @@ RULES:
 - Personal org is not a real organization. Org book outflow is Send only.
 - Never say a transaction is saved; say it is ready for user approval.
 - Use book IDs from USER BOOKS for transaction actions.
-- If the user asks to process pending audio notes, read the PENDING AUDIO NOTES section. For clear notes, create transaction action blocks. For unclear notes, ask the user what they meant.
+- If the user asks to process pending audio notes, read the PENDING AUDIO NOTES section. For clear notes, create transaction action blocks and INCLUDE "audioNoteId":"<id>" inside the data.
+- If the user asks to SEE or LIST pending audio notes, you MUST include the exact AUDIO NOTES DATA BLOCK in your response so the UI can render it.
 
 USER: ${userData?.name || 'User'}
 ACTIVE BOOK: ${activeBookEntry ? `"${activeBookEntry.book.name}" (${activeBookEntry.book.id})` : 'None'}
@@ -5256,6 +5281,8 @@ DATA formats:
 [DATA type:balance] [{"book":"Name","balance":1000,"org":"OrgName"}] [/DATA]
 [DATA type:category] [{"category":"Food","amount":500,"count":3,"percentage":40}] [/DATA]
 [DATA type:transactions] [{"note":"...","amount":50,"type":"expense","category":"Transport"}] [/DATA]
+AUDIO NOTES DATA BLOCK (copy this if user asks to see audios):
+${audioNotesDataBlock}
 
 If amount, book, or a DETAILED note is missing, ask ONE clarifying question politely. No action blocks yet.`;
 
