@@ -2126,8 +2126,8 @@ app.post('/api/transactions', authenticateToken, async (req, res) => {
           return res.status(400).json({ error: 'Voucher must reference a disbursement from the same organization' });
         }
 
-        const bypass = await checkApprovalBypass(book.organizationId, req.user.id);
-        const voucherStatus = bypass ? 'approved' : 'pending_org';
+        // Force all vouchers to require manual approval by org admin, regardless of creator's role
+        const voucherStatus = 'pending_org';
 
         const [txn, updatedBook] = await prisma.$transaction([
           prisma.transaction.create({ data: { bookId, amount: parsedAmount, type: 'expense', note, category, contact, orgFundId, createdById: req.user.id, reconStatus: voucherStatus, imageUrl, clientRef: txnClientRef } }),
@@ -2140,8 +2140,8 @@ app.post('/api/transactions', authenticateToken, async (req, res) => {
       }
 
       if (isVoucherBook) {
-        const bypass = await checkApprovalBypass(targetBook.organizationId, req.user.id);
-        const voucherStatus = bypass ? 'approved' : 'pending_org';
+        // Force all vouchers to require manual approval by org admin, regardless of creator's role
+        const voucherStatus = 'pending_org';
 
         const [txn, updatedBook] = await prisma.$transaction([
           prisma.transaction.create({
@@ -2161,30 +2161,6 @@ app.post('/api/transactions', authenticateToken, async (req, res) => {
           }),
           prisma.book.update({ where: { id: bookId }, data: { balance: { decrement: parsedAmount } } })
         ]);
-
-        if (bypass) {
-          // If bypassed immediately, apply the voucher expense in Sangeet Academy
-          await prisma.$transaction([
-            // Decrement Sangeet Academy's book balance
-            prisma.book.update({ where: { id: targetBook.id }, data: { balance: { decrement: parsedAmount } } }),
-            // Create an expense transaction in Sangeet Academy's book
-            prisma.transaction.create({
-              data: {
-                bookId: targetBook.id,
-                amount: parsedAmount,
-                type: 'expense',
-                note: note || '',
-                category: category || 'Voucher',
-                contact,
-                orgFundId: targetBook.id,
-                createdById: req.user.id,
-                reconStatus: 'approved',
-                clientRef: txnClientRef,
-                imageUrl
-              }
-            })
-          ]);
-        }
 
         broadcast({ type: "data_changed" });
         const enriched = await enrichTxn(txn);
