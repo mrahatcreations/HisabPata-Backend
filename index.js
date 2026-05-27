@@ -5119,7 +5119,7 @@ RECENT TXNS: ${txnSummary}
 ${hintsSection}
 ${verifiedDataSection ? `\nVERIFIED DATA:\n${verifiedDataSection}\n` : ''}
 
-TRANSACTIONS: use PARSED values when bookId exists; otherwise ask which book (names only). note is required from user's words.
+TRANSACTIONS: To create a transaction, you MUST have the exact amount, the book name, AND a highly detailed note/description. If the user provides a short or vague note (e.g., "50 tk for transport"), you MUST ask them for a detailed description (e.g., "how did you travel? who was with you? what is the exact reason?"). DO NOT create the action block until the user provides a detailed, clear explanation.
 
 RESPONSE:
 - Plain text, no markdown. Max 2 short sentences (Bangla or English).
@@ -5134,7 +5134,7 @@ DATA formats:
 [DATA type:category] [{"category":"Food","amount":500,"count":3,"percentage":40}] [/DATA]
 [DATA type:transactions] [{"note":"...","amount":50,"type":"expense","category":"Transport"}] [/DATA]
 
-If amount or book missing, ask ONE clarifying question. No action blocks yet.`;
+If amount, book, or a DETAILED note is missing, ask ONE clarifying question. No action blocks yet.`;
 
   return {
     systemPrompt,
