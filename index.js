@@ -2333,7 +2333,15 @@ app.post('/api/transactions', authenticateToken, async (req, res) => {
     res.status(201).json({ transaction: enriched, book: createResult.updatedBook });
   } catch (error) {
     console.error('Create transaction error:', error);
-    res.status(500).json({ error: 'Server error creating transaction' });
+    const hint = error?.code === 'P2022'
+      ? 'Database schema out of date — run: npx prisma migrate deploy'
+      : error?.code === 'P2003'
+        ? 'Invalid book or linked record — try logout and sync books again'
+        : null;
+    res.status(500).json({
+      error: hint || 'Server error creating transaction',
+      ...(process.env.NODE_ENV !== 'production' && error?.message ? { detail: error.message } : {}),
+    });
   }
 });
 
