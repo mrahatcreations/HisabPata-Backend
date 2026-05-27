@@ -5060,6 +5060,34 @@ app.delete('/api/admin/orgs/:id/members/:memberId', authenticateAdmin, async (re
   }
 });
 
+// --- ADMIN: Delete organization ---
+app.delete('/api/admin/orgs/:id', authenticateAdmin, async (req, res) => {
+  try {
+    const org = await prisma.organization.findUnique({ where: { id: req.params.id } });
+    if (!org) return res.status(404).json({ error: 'Organization not found' });
+
+    const bookIds = (await prisma.book.findMany({ where: { organizationId: req.params.id }, select: { id: true } })).map(b => b.id);
+    const txnIds = bookIds.length > 0
+      ? (await prisma.transaction.findMany({ where: { bookId: { in: bookIds } }, select: { id: true } })).map(t => t.id)
+      : [];
+
+    await prisma.$transaction([
+      prisma.transaction.updateMany({ where: { recipientOrgId: req.params.id }, data: { recipientOrgId: null } }),
+      ...(bookIds.length > 0 ? [prisma.transaction.updateMany({ where: { orgFundId: { in: bookIds } }, data: { orgFundId: null } })] : []),
+      ...(txnIds.length > 0 ? [prisma.transaction.updateMany({ where: { linkedTransactionId: { in: txnIds } }, data: { linkedTransactionId: null } })] : []),
+      prisma.organizationMember.deleteMany({ where: { organizationId: req.params.id } }),
+      ...(bookIds.length > 0 ? [prisma.transaction.deleteMany({ where: { bookId: { in: bookIds } } })] : []),
+      ...(bookIds.length > 0 ? [prisma.book.deleteMany({ where: { organizationId: req.params.id } })] : []),
+      prisma.organization.delete({ where: { id: req.params.id } }),
+    ]);
+
+    res.json({ message: 'Organization deleted successfully' });
+  } catch (error) {
+    console.error('[Admin] Failed to delete org:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 // --- ADMIN: Delete user ---
 app.delete('/api/admin/users/:id', authenticateAdmin, async (req, res) => {
   try {
