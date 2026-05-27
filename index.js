@@ -110,6 +110,18 @@ app.use((req, res, next) => {
 // Healthcheck endpoint (no auth required)
 app.get('/api/health', (_req, res) => res.json({ status: 'ok' }));
 
+// Debug: admin key check (only in dev)
+if (process.env.NODE_ENV !== 'production') {
+  app.get('/api/debug/admin-key', (_req, res) => {
+    const key = (process.env.ADMIN_KEY || '').trim();
+    res.json({
+      set: !!process.env.ADMIN_KEY,
+      length: key.length,
+      prefix: key.length > 0 ? key[0] + '***' + key[key.length - 1] : 'empty',
+    });
+  });
+}
+
 // Middleware: Authenticate JWT Token
 const authenticateToken = (req, res, next) => {
   const authHeader = req.headers['authorization'];
@@ -142,7 +154,9 @@ const authenticateToken = (req, res, next) => {
 // Middleware: Admin-only access via admin key
 const authenticateAdmin = (req, res, next) => {
   const adminKey = req.headers['x-admin-key'];
-  if (!adminKey || adminKey !== (process.env.ADMIN_KEY || '').trim()) {
+  const expectedKey = (process.env.ADMIN_KEY || '').trim();
+  if (!adminKey || adminKey !== expectedKey) {
+    console.error(`ADMIN_AUTH_FAIL: provided="${adminKey?.length || 0}chars" expected="${expectedKey?.length || 0}chars" path="${req.path}"`);
     return res.status(401).json({ error: 'Valid admin key required' });
   }
   next();
