@@ -5047,6 +5047,53 @@ const detectAiIntent = (messages) => {
 
 const AI_LLM_HISTORY_LIMIT = 6;
 const AI_LLM_CONTENT_LIMIT = 1800;
+const GEMINI_DEFAULT_BASE = 'https://generativelanguage.googleapis.com';
+
+const normalizeGeminiBaseUrl = (baseUrl) => {
+  if (!baseUrl || typeof baseUrl !== 'string') return null;
+  let base = baseUrl.trim().replace(/\/+$/, '');
+  if (!base) return null;
+  // Users sometimes paste .../v1beta or longer paths from API docs.
+  base = base.replace(/\/v1beta(\/.*)?$/i, '');
+  return base;
+};
+
+const buildGeminiRequestUrl = (baseUrl, model, mode, apiKey) => {
+  const base = normalizeGeminiBaseUrl(baseUrl) || GEMINI_DEFAULT_BASE;
+  const endpoint = mode === 'stream' ? 'streamGenerateContent' : 'generateContent';
+  const query = mode === 'stream'
+    ? `alt=sse&key=${encodeURIComponent(apiKey)}`
+    : `key=${encodeURIComponent(apiKey)}`;
+  return `${base}/v1beta/models/${encodeURIComponent(model)}:${endpoint}?${query}`;
+};
+
+const safeFetchJson = async (res) => {
+  const text = await res.text();
+  if (!text) return {};
+  try {
+    return JSON.parse(text);
+  } catch {
+    return { error: { message: text.slice(0, 300) } };
+  }
+};
+
+const geminiTextFromResponse = (data) => {
+  const parts = data?.candidates?.[0]?.content?.parts;
+  if (!Array.isArray(parts)) return '';
+  return parts.map((p) => (typeof p?.text === 'string' ? p.text : '')).join('');
+};
+
+const isGeminiThinkingModel = (model) => /gemini-2\.5|gemini-3/i.test(String(model || ''));
+
+const resolveAiMaxTokens = (maxTokens, model = '', provider = '') => {
+  const parsed = maxTokens != null ? parseInt(maxTokens, 10) : 512;
+  const safe = Number.isFinite(parsed) ? parsed : 512;
+  if (provider === 'gemini' && isGeminiThinkingModel(model)) {
+    // 2.5+ uses internal "thoughts" tokens — low caps yield empty/broken replies.
+    return Math.min(Math.max(safe, 2048), 8192);
+  }
+  return Math.min(Math.max(safe, 256), 2048);
+};
 
 const truncateAiMessagesForLlm = (messages, maxCount = AI_LLM_HISTORY_LIMIT) => {
   if (!Array.isArray(messages)) return [];
@@ -5054,12 +5101,6 @@ const truncateAiMessagesForLlm = (messages, maxCount = AI_LLM_HISTORY_LIMIT) => 
     role: m.role,
     content: String(m.content || '').slice(0, AI_LLM_CONTENT_LIMIT),
   }));
-};
-
-const resolveAiMaxTokens = (maxTokens) => {
-  const parsed = maxTokens != null ? parseInt(maxTokens, 10) : 512;
-  if (!Number.isFinite(parsed)) return 512;
-  return Math.min(Math.max(parsed, 128), 1024);
 };
 
 const saveAiChatTurn = async ({ userId, userMessage, assistantMessage, bookId, model, provider, intent }) => {
@@ -5350,10 +5391,15 @@ const prepareAiAgentRequest = async (userId, bookId, messages) => {
     },
   });
 
-  const pendingAudioNotes = await prisma.audioNote.findMany({
-    where: { userId, status: 'pending' },
-    orderBy: { recordedAt: 'asc' }
-  });
+  let pendingAudioNotes = [];
+  try {
+    pendingAudioNotes = await prisma.audioNote.findMany({
+      where: { userId, status: 'pending' },
+      orderBy: { recordedAt: 'asc' },
+    });
+  } catch (audioErr) {
+    console.warn('[AI Agent] AudioNote query skipped:', audioErr.message);
+  }
   const audioNotesPayload = pendingAudioNotes.map(n => ({
     id: n.id,
     audioUrl: n.audioUrl || '',
@@ -5618,8 +5664,13 @@ app.post('/api/ai/agent', authenticateToken, async (req, res) => {
       maxTokens: resolved.maxTokens,
     };
 
-    if (!provider || !apiKey || !model || !messages) {
-      return res.status(400).json({ error: 'Missing required fields: provider, apiKey, model, messages' });
+    if (!provider || !apiKey || !messages) {
+      return res.status(400).json({ error: 'Missing required fields: provider, apiKey, messages' });
+    }
+    if (!model || !String(model).trim()) {
+      return res.status(400).json({
+        error: 'AI model is not selected. Run Find Working Models in AI settings, pick a model, and save.',
+      });
     }
 
     const agentCtx = await prepareAiAgentRequest(req.user.id, bookId, messages);
@@ -5661,15 +5712,13 @@ app.post('/api/ai/agent', authenticateToken, async (req, res) => {
     }
 
     const tempVal = temperature != null ? parseFloat(temperature) : recommendedTemperature;
-    const maxTokVal = resolveAiMaxTokens(maxTokens);
+    const maxTokVal = resolveAiMaxTokens(maxTokens, model, provider);
 
     // ── Forward to AI Provider ──
     let aiResponseText = '';
 
     if (provider === 'gemini') {
-      const url = baseUrl
-        ? `${baseUrl}/v1beta/models/${model}:generateContent?key=${apiKey}`
-        : `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
+      const url = buildGeminiRequestUrl(baseUrl, model, 'generate', apiKey);
 
       const contents = llmMessages.map(m => ({
         role: m.role === 'user' ? 'user' : 'model',
@@ -5685,11 +5734,11 @@ app.post('/api/ai/agent', authenticateToken, async (req, res) => {
           generationConfig: { temperature: tempVal, maxOutputTokens: maxTokVal }
         })
       });
-      const geminiData = await geminiRes.json();
+      const geminiData = await safeFetchJson(geminiRes);
       if (!geminiRes.ok) {
         return res.status(geminiRes.status).json({ error: geminiData.error?.message || 'Gemini API Error' });
       }
-      aiResponseText = geminiData.candidates?.[0]?.content?.parts?.[0]?.text || '';
+      aiResponseText = geminiTextFromResponse(geminiData);
 
     } else if (provider === 'openai') {
       const url = baseUrl ? `${baseUrl}/v1/chat/completions` : 'https://api.openai.com/v1/chat/completions';
@@ -5764,7 +5813,8 @@ app.post('/api/ai/agent', authenticateToken, async (req, res) => {
 
   } catch (error) {
     console.error('[AI Agent] Error:', error);
-    res.status(500).json({ error: 'Internal server error' });
+    const detail = error?.message || 'Internal server error';
+    res.status(500).json({ error: detail });
   }
 });
 
@@ -5785,8 +5835,13 @@ app.post('/api/ai/agent/stream', authenticateToken, async (req, res) => {
       maxTokens: resolved.maxTokens,
     };
 
-    if (!provider || !apiKey || !model || !messages) {
-      return res.status(400).json({ error: 'Missing required fields: provider, apiKey, model, messages' });
+    if (!provider || !apiKey || !messages) {
+      return res.status(400).json({ error: 'Missing required fields: provider, apiKey, messages' });
+    }
+    if (!model || !String(model).trim()) {
+      return res.status(400).json({
+        error: 'AI model is not selected. Run Find Working Models in AI settings, pick a model, and save.',
+      });
     }
 
     const agentCtx = await prepareAiAgentRequest(req.user.id, bookId, messages);
@@ -5839,12 +5894,10 @@ app.post('/api/ai/agent/stream', authenticateToken, async (req, res) => {
     }
 
     const tempVal = temperature != null ? parseFloat(temperature) : recommendedTemperature;
-    const maxTokVal = resolveAiMaxTokens(maxTokens);
+    const maxTokVal = resolveAiMaxTokens(maxTokens, model, provider);
 
     if (provider === 'gemini') {
-      const url = baseUrl
-        ? `${baseUrl}/v1beta/models/${model}:streamGenerateContent?alt=sse&key=${apiKey}`
-        : `https://generativelanguage.googleapis.com/v1beta/models/${model}:streamGenerateContent?alt=sse&key=${apiKey}`;
+      const url = buildGeminiRequestUrl(baseUrl, model, 'stream', apiKey);
 
       const contents = llmMessages.map(m => ({
         role: m.role === 'user' ? 'user' : 'model',
@@ -5862,30 +5915,36 @@ app.post('/api/ai/agent/stream', authenticateToken, async (req, res) => {
       });
 
       if (!geminiRes.ok) {
-        const errData = await geminiRes.json();
+        const errData = await safeFetchJson(geminiRes);
         sendEvent('error', { message: errData.error?.message || 'Gemini API Error' });
         sendEvent('done', {});
         return res.end();
       }
 
-      const reader = geminiRes.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = '';
       let fullText = '';
 
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
+      if (!geminiRes.body) {
+        const data = await safeFetchJson(geminiRes);
+        fullText = geminiTextFromResponse(data);
+        if (fullText) sendEvent('chunk', { content: fullText });
+      } else {
+        const reader = geminiRes.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
 
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split('\n');
-        buffer = lines.pop() || '';
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
 
-        for (const line of lines) {
-          if (line.startsWith('data: ')) {
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split('\n');
+          buffer = lines.pop() || '';
+
+          for (const line of lines) {
+            if (!line.startsWith('data: ')) continue;
             try {
               const data = JSON.parse(line.slice(6));
-              const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
+              const text = geminiTextFromResponse(data);
               if (text) {
                 fullText += text;
                 sendEvent('chunk', { content: text });
@@ -5893,6 +5952,33 @@ app.post('/api/ai/agent/stream', authenticateToken, async (req, res) => {
             } catch (e) { /* skip parse errors */ }
           }
         }
+      }
+
+      if (!fullText.trim()) {
+        const fallbackUrl = buildGeminiRequestUrl(baseUrl, model, 'generate', apiKey);
+        const fallbackRes = await fetch(fallbackUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            contents,
+            systemInstruction: { parts: [{ text: systemPrompt }] },
+            generationConfig: { temperature: tempVal, maxOutputTokens: maxTokVal },
+          }),
+        });
+        const fallbackData = await safeFetchJson(fallbackRes);
+        if (fallbackRes.ok) {
+          fullText = geminiTextFromResponse(fallbackData);
+          if (fullText) sendEvent('chunk', { content: fullText });
+        }
+      }
+
+      if (!fullText.trim()) {
+        const hint = isGeminiThinkingModel(model)
+          ? 'Gemini 2.5+ needs higher Max Tokens (at least 2048). Open AI Settings, set Max Tokens to 2048 or higher, save, then retry.'
+          : 'Gemini returned an empty response. Try another model from Find Working Models.';
+        sendEvent('error', { message: hint });
+        sendEvent('done', {});
+        return res.end();
       }
 
       await emitAiStreamFinal(sendEvent, fullText, agentCtx, req.user.id, messages, { model, provider });
@@ -6022,10 +6108,11 @@ app.post('/api/ai/agent/stream', authenticateToken, async (req, res) => {
 
   } catch (error) {
     console.error('[AI Agent Stream] Error:', error);
+    const detail = error?.message || 'Internal server error';
     if (!res.headersSent) {
-      res.status(500).json({ error: 'Internal server error' });
+      res.status(500).json({ error: detail });
     } else {
-      res.write(`data: ${JSON.stringify({ type: 'error', message: 'Internal server error' })}\n\n`);
+      res.write(`data: ${JSON.stringify({ type: 'error', message: detail })}\n\n`);
       res.end();
     }
   }
