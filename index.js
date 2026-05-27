@@ -142,7 +142,7 @@ const authenticateToken = (req, res, next) => {
 // Middleware: Admin-only access via admin key
 const authenticateAdmin = (req, res, next) => {
   const adminKey = req.headers['x-admin-key'];
-  if (!adminKey || adminKey !== process.env.ADMIN_KEY) {
+  if (!adminKey || adminKey !== (process.env.ADMIN_KEY || '').trim()) {
     return res.status(401).json({ error: 'Valid admin key required' });
   }
   next();
