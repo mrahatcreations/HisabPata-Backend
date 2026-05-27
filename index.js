@@ -1146,8 +1146,8 @@ app.post('/api/transactions', authenticateToken, async (req, res) => {
         broadcastToUsers(adminIds, { type: "deficit_send", message: { bn: bnMsg, en: enMsg }, transaction: enriched });
       }
 
-      // Notify recipient immediately if org approval was bypassed
-      if (bypassOrgApproval) {
+      // Notify recipient immediately if org approval was bypassed (skip for already-approved self-sends)
+      if (bypassOrgApproval && initialStatus !== 'approved') {
         broadcastToUser(recipientUserId, { type: "pending_send_received", transaction: enriched });
       }
       return res.status(201).json({ transaction: enriched, isHandshake: true, approvalBypassed: bypassOrgApproval });
@@ -1384,12 +1384,135 @@ app.put('/api/transactions/:id', authenticateToken, async (req, res) => {
           }
         }
 
+        // Handle linked transaction for self-send / own-org-send (auto-approve)
+        if (txn.linkedTransactionId) {
+          const isSelfSend = txn.recipientUserId === req.user.id;
+          let isOwnOrgSend = false;
+          if (txn.recipientOrgId) {
+            isOwnOrgSend = await checkApprovalBypass(txn.recipientOrgId, req.user.id);
+          }
+          if (isSelfSend || isOwnOrgSend) {
+            const linkedTxn = await prisma.transaction.findUnique({ where: { id: txn.linkedTransactionId } });
+            if (linkedTxn) {
+              const linkedChanges = {};
+              if (changes.amount !== undefined) linkedChanges.amount = parsedAmount;
+              if (changes.note !== undefined) linkedChanges.note = changes.note;
+              if (Object.keys(linkedChanges).length > 0) {
+                let linkedBalAdj = 0;
+                if (changes.amount !== undefined && changes.amount !== linkedTxn.amount) {
+                  if (linkedTxn.type === 'income') linkedBalAdj = parsedAmount - linkedTxn.amount;
+                  else if (linkedTxn.type === 'expense') linkedBalAdj = linkedTxn.amount - parsedAmount;
+                }
+                await prisma.transaction.update({
+                  where: { id: txn.linkedTransactionId },
+                  data: {
+                    ...linkedChanges,
+                    updateHistory: [
+                      ...(linkedTxn.updateHistory || []),
+                      { timestamp: new Date().toISOString(), userId: req.user.id, userName: user?.name || 'Unknown', action: 'edit (linked)', changes: { old: { amount: linkedTxn.amount, note: linkedTxn.note }, new: linkedChanges } },
+                    ],
+                  },
+                });
+                if (linkedBalAdj !== 0) {
+                  const linkedBook = await prisma.book.findUnique({ where: { id: linkedTxn.bookId } });
+                  if (linkedBook) {
+                    await prisma.book.update({ where: { id: linkedTxn.bookId }, data: { balance: { increment: linkedBalAdj } } });
+                  }
+                }
+              }
+            }
+          }
+        }
+
         return updatedTxn;
       });
       broadcast({ type: 'data_changed' });
       const enrichedPersonal = await enrichTxn(personalUpdated);
       return res.json({ transaction: enrichedPersonal, message: 'Transaction updated' });
     } else if (txn.reconStatus === 'approved') {
+      // ── Auto-approve for self-send / own-org-send (skip pending) ──
+      const isSelfSend = txn.recipientUserId === req.user.id;
+      let isOwnOrgSend = false;
+      if (txn.recipientOrgId) {
+        isOwnOrgSend = await checkApprovalBypass(txn.recipientOrgId, req.user.id);
+      }
+      if (isSelfSend || isOwnOrgSend) {
+        let balanceAdjustment = 0;
+        if (changes.amount !== undefined && changes.amount !== txn.amount) {
+          if (txn.type === 'expense') balanceAdjustment = txn.amount - parsedAmount;
+          else if (txn.type === 'income') balanceAdjustment = parsedAmount - txn.amount;
+        }
+        const updated = await prisma.$transaction(async (prisma) => {
+          const updatedTxn = await prisma.transaction.update({
+            where: { id: txnId },
+            data: {
+              ...changes,
+              updateHistory: [
+                ...(txn.updateHistory || []),
+                {
+                  timestamp: new Date().toISOString(),
+                  userId: req.user.id,
+                  userName: user?.name || 'Unknown',
+                  action: 'edit',
+                  changes: { old: { amount: txn.amount, type: txn.type, category: txn.category, note: txn.note }, new: changes },
+                },
+              ],
+            },
+          });
+          if (balanceAdjustment !== 0) {
+            await prisma.book.update({ where: { id: book.id }, data: { balance: { increment: balanceAdjustment } } });
+          }
+          // Handle linked transaction
+          if (txn.linkedTransactionId) {
+            const linkedTxn = await prisma.transaction.findUnique({ where: { id: txn.linkedTransactionId } });
+            if (linkedTxn) {
+              const linkedChanges = {};
+              if (changes.amount !== undefined) linkedChanges.amount = parsedAmount;
+              if (changes.note !== undefined) linkedChanges.note = changes.note;
+              if (Object.keys(linkedChanges).length > 0) {
+                let linkedBalAdj = 0;
+                if (changes.amount !== undefined && changes.amount !== linkedTxn.amount) {
+                  if (linkedTxn.type === 'income') linkedBalAdj = parsedAmount - linkedTxn.amount;
+                  else if (linkedTxn.type === 'expense') linkedBalAdj = linkedTxn.amount - parsedAmount;
+                }
+                await prisma.transaction.update({
+                  where: { id: txn.linkedTransactionId },
+                  data: {
+                    ...linkedChanges,
+                    updateHistory: [
+                      ...(linkedTxn.updateHistory || []),
+                      { timestamp: new Date().toISOString(), userId: req.user.id, userName: user?.name || 'Unknown', action: 'edit (linked)', changes: { old: { amount: linkedTxn.amount, note: linkedTxn.note }, new: linkedChanges } },
+                    ],
+                  },
+                });
+                if (linkedBalAdj !== 0) {
+                  await prisma.book.update({ where: { id: linkedTxn.bookId }, data: { balance: { increment: linkedBalAdj } } });
+                }
+              }
+            }
+          }
+          // Sync to sub-book parent mirror transaction if it exists
+          const mirror = await findMirrorTxn(txn, book);
+          if (mirror) {
+            const mirrorChanges = {};
+            if (changes.amount !== undefined) mirrorChanges.amount = parsedAmount;
+            if (changes.note !== undefined) {
+              mirrorChanges.note = changes.note ? (changes.note + ' [' + book.name + ']') : ('[' + book.name + ']');
+            }
+            if (Object.keys(mirrorChanges).length > 0) {
+              await prisma.transaction.update({ where: { id: mirror.id }, data: mirrorChanges });
+            }
+            if (balanceAdjustment !== 0) {
+              await prisma.book.update({ where: { id: book.parentBookId }, data: { balance: { increment: balanceAdjustment } } });
+            }
+          }
+          return updatedTxn;
+        });
+        broadcast({ type: "data_changed" });
+        const enriched = await enrichTxn(updated);
+        return res.json({ transaction: enriched, message: 'Transaction updated' });
+      }
+
       // Reverse current balance to compute the pre-txn balance
       let preTxnBalance = book.balance;
       if (txn.type === 'expense') {
@@ -1785,6 +1908,48 @@ app.delete('/api/transactions/:id', authenticateToken, async (req, res) => {
     }
 
     if (txn.reconStatus === 'approved') {
+      // ── Auto-approve for self-send / own-org-send (skip pending) ──
+      const isSelfSend = txn.recipientUserId === req.user.id;
+      let isOwnOrgSend = false;
+      if (txn.recipientOrgId) {
+        isOwnOrgSend = await checkApprovalBypass(txn.recipientOrgId, req.user.id);
+      }
+      if (isSelfSend || isOwnOrgSend) {
+        await prisma.$transaction(async (prisma) => {
+          let balanceAdjustment = 0;
+          if (txn.type === 'expense') balanceAdjustment = txn.amount;
+          else if (txn.type === 'income') balanceAdjustment = -txn.amount;
+          if (balanceAdjustment !== 0) {
+            await prisma.book.update({ where: { id: book.id }, data: { balance: { increment: balanceAdjustment } } });
+          }
+          if (txn.linkedTransactionId) {
+            const linked = await prisma.transaction.findUnique({ where: { id: txn.linkedTransactionId } });
+            if (linked) {
+              const linkedBook = await prisma.book.findUnique({ where: { id: linked.bookId } });
+              if (linkedBook) {
+                let linkedAdj = 0;
+                if (linked.type === 'income') linkedAdj = -linked.amount;
+                else if (linked.type === 'expense') linkedAdj = linked.amount;
+                if (linkedAdj !== 0) {
+                  await prisma.book.update({ where: { id: linked.bookId }, data: { balance: { increment: linkedAdj } } });
+                }
+              }
+              await prisma.transaction.delete({ where: { id: linked.id } });
+            }
+          }
+          // Sync to sub-book parent mirror transaction
+          const mirror = await findMirrorTxn(txn, book);
+          if (mirror) {
+            let mirrorAdj = mirror.type === 'income' ? -mirror.amount : mirror.amount;
+            await prisma.book.update({ where: { id: book.parentBookId }, data: { balance: { increment: mirrorAdj } } });
+            await prisma.transaction.delete({ where: { id: mirror.id } });
+          }
+          await prisma.transaction.delete({ where: { id: txnId } });
+        });
+        broadcast({ type: "data_changed" });
+        return res.json({ message: 'Transaction deleted' });
+      }
+
       // Reverse balance
       let reversedBalance = book.balance;
       if (txn.type === 'expense') {
@@ -2028,7 +2193,24 @@ app.post('/api/transactions/:id/action', authenticateToken, async (req, res) => 
       }
     }
 
-    if (!isRecipient && !(await hasAdminOrEditorAccess(txnBook.organizationId, req.user.id))) {
+    // Also check if the caller is admin/editor of the fund's org (for vouchers from personal books)
+    let hasFundOrgAccess = false;
+    if (txn.orgFundId) {
+      const fundBook = await prisma.book.findUnique({ where: { id: txn.orgFundId }, select: { organizationId: true } });
+      if (fundBook) {
+        hasFundOrgAccess = await hasAdminOrEditorAccess(fundBook.organizationId, req.user.id);
+      } else {
+        const fundTxn = await prisma.transaction.findUnique({ where: { id: txn.orgFundId }, select: { bookId: true } });
+        if (fundTxn) {
+          const fundTxnBook = await prisma.book.findUnique({ where: { id: fundTxn.bookId }, select: { organizationId: true } });
+          if (fundTxnBook) {
+            hasFundOrgAccess = await hasAdminOrEditorAccess(fundTxnBook.organizationId, req.user.id);
+          }
+        }
+      }
+    }
+
+    if (!isRecipient && !(await hasAdminOrEditorAccess(txnBook.organizationId, req.user.id)) && !hasFundOrgAccess) {
       return res.status(403).json({ error: 'Only admins, editors, or the recipient can approve/reject transactions' });
     }
 
@@ -2036,7 +2218,11 @@ app.post('/api/transactions/:id/action', authenticateToken, async (req, res) => 
     if (txn.pendingAction && ['edit', 'delete'].includes(txn.pendingAction)) {
       const pendingDataObj = txn.pendingData ? (typeof txn.pendingData === 'string' ? JSON.parse(txn.pendingData) : txn.pendingData) : {};
       if (pendingDataObj.requestedBy === req.user.id) {
-        return res.status(403).json({ error: 'You cannot approve or reject your own edit/delete request. The other party must approve it.' });
+        // Allow self-approval if user has admin/editor access to the book's org
+        const canSelfApprove = await hasAdminOrEditorAccess(txnBook.organizationId, req.user.id);
+        if (!canSelfApprove) {
+          return res.status(403).json({ error: 'You cannot approve or reject your own edit/delete request. The other party must approve it.' });
+        }
       }
     }
 
@@ -2848,19 +3034,28 @@ app.get('/api/approvals/pending', authenticateToken, async (req, res) => {
     if (adminBookIds.length > 0) {
       const pendingTxns = await prisma.transaction.findMany({
         where: {
-          bookId: { in: adminBookIds },
           reconStatus: { in: ['pending_org', 'pending_recipient', 'pending'] },
           OR: [
-            { category: 'Send' },
-            { orgFundId: { not: null } },
-            { recipientOrgId: { not: null } },
-            { pendingAction: { not: null } }
+            {
+              bookId: { in: adminBookIds },
+              OR: [
+                { category: 'Send' },
+                { orgFundId: { not: null } },
+                { recipientOrgId: { not: null } },
+                { pendingAction: { not: null } }
+              ]
+            },
+            {
+              bookId: { notIn: adminBookIds },
+              orgFundId: { in: adminBookIds }
+            }
           ]
         },
         orderBy: { createdAt: 'desc' }
       });
 
       for (const txn of pendingTxns) {
+        const isFundVoucher = txn.orgFundId && !adminBookIds.includes(txn.bookId);
         const book = await prisma.book.findUnique({ where: { id: txn.bookId }, include: { organization: true } });
         let recipientName = null;
         if (txn.recipientUserId) {
@@ -2882,6 +3077,18 @@ app.get('/api/approvals/pending', authenticateToken, async (req, res) => {
             }
           }
         }
+
+        let bookName = book?.name || 'Unknown';
+        let orgName = book?.organization?.name || 'Unknown';
+
+        if (isFundVoucher) {
+          const fundBook = await prisma.book.findUnique({ where: { id: txn.orgFundId }, include: { organization: true } });
+          if (fundBook) {
+            bookName = fundBook.name;
+            orgName = fundBook.organization?.name || 'Unknown';
+          }
+        }
+
         const actionLabel = txn.pendingAction === 'delete'
           ? 'Delete Request'
           : txn.pendingAction === 'edit'
@@ -2901,8 +3108,8 @@ app.get('/api/approvals/pending', authenticateToken, async (req, res) => {
           amount: txn.amount,
           category: txn.category,
           recipientName,
-          bookName: book?.name || 'Unknown',
-          orgName: book?.organization?.name || 'Unknown',
+          bookName,
+          orgName,
           createdAt: txn.createdAt,
           pendingAction: txn.pendingAction,
           reconStatus: txn.reconStatus,
@@ -4674,6 +4881,173 @@ app.put('/api/admin/complaints/:id', authenticateAdmin, async (req, res) => {
     res.json(complaint);
   } catch (error) {
     console.error('[Admin] Failed to update complaint:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// --- ADMIN: List all organizations ---
+app.get('/api/admin/orgs', authenticateAdmin, async (req, res) => {
+  try {
+    const orgs = await prisma.organization.findMany({
+      include: {
+        _count: { select: { members: true, books: true } },
+        members: { where: { role: 'admin', status: 'active' }, include: { user: { select: { id: true, name: true, email: true } } } }
+      },
+      orderBy: { createdAt: 'desc' },
+    });
+    const result = orgs.map(o => ({
+      id: o.id, name: o.name, isPersonal: o.isPersonal, inviteCode: o.inviteCode,
+      approvalPolicy: o.approvalPolicy, createdAt: o.createdAt,
+      memberCount: o._count.members, bookCount: o._count.books,
+      admins: o.members.map(m => ({ id: m.user.id, name: m.user.name, email: m.user.email }))
+    }));
+    res.json(result);
+  } catch (error) {
+    console.error('[Admin] Failed to fetch orgs:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// --- ADMIN: List members of an organization ---
+app.get('/api/admin/orgs/:id/members', authenticateAdmin, async (req, res) => {
+  try {
+    const members = await prisma.organizationMember.findMany({
+      where: { organizationId: req.params.id },
+      include: { user: { select: { id: true, name: true, email: true, phoneNumber: true, isAdmin: true } } },
+      orderBy: { createdAt: 'desc' },
+    });
+    res.json(members.map(m => ({
+      id: m.id, userId: m.userId, role: m.role, status: m.status, permissions: m.permissions, createdAt: m.createdAt,
+      user: m.user
+    })));
+  } catch (error) {
+    console.error('[Admin] Failed to fetch members:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// --- ADMIN: Remove member from organization ---
+app.delete('/api/admin/orgs/:id/members/:memberId', authenticateAdmin, async (req, res) => {
+  try {
+    const member = await prisma.organizationMember.findUnique({ where: { id: req.params.memberId } });
+    if (!member) return res.status(404).json({ error: 'Member not found' });
+    if (member.organizationId !== req.params.id) return res.status(400).json({ error: 'Member does not belong to this org' });
+    await prisma.organizationMember.delete({ where: { id: req.params.memberId } });
+    res.json({ message: 'Member removed' });
+  } catch (error) {
+    console.error('[Admin] Failed to remove member:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// --- ADMIN: Delete user ---
+app.delete('/api/admin/users/:id', authenticateAdmin, async (req, res) => {
+  try {
+    const user = await prisma.user.findUnique({ where: { id: req.params.id } });
+    if (!user) return res.status(404).json({ error: 'User not found' });
+
+    // Delete user's complaints, memberships, transactions, books, personal orgs
+    await prisma.complaint.deleteMany({ where: { userId: req.params.id } });
+    await prisma.organizationMember.deleteMany({ where: { userId: req.params.id } });
+
+    // Find and delete user's personal orgs and their data
+    const personalOrgs = await prisma.organization.findMany({ where: { isPersonal: true, members: { some: { userId: req.params.id } } } });
+    for (const org of personalOrgs) {
+      await prisma.transaction.deleteMany({ where: { book: { organizationId: org.id } } });
+      await prisma.book.deleteMany({ where: { organizationId: org.id } });
+      await prisma.organizationMember.deleteMany({ where: { organizationId: org.id } });
+      await prisma.organization.delete({ where: { id: org.id } });
+    }
+
+    await prisma.user.delete({ where: { id: req.params.id } });
+    res.json({ message: 'User deleted' });
+  } catch (error) {
+    console.error('[Admin] Failed to delete user:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// --- ADMIN: System-wide analytics ---
+app.get('/api/admin/stats', authenticateAdmin, async (req, res) => {
+  try {
+    const [userCount, orgCount, bookCount, txnCount, totalExpense, totalIncome] = await Promise.all([
+      prisma.user.count(),
+      prisma.organization.count(),
+      prisma.book.count(),
+      prisma.transaction.count(),
+      prisma.transaction.aggregate({ _sum: { amount: true }, where: { type: 'expense', reconStatus: 'approved' } }),
+      prisma.transaction.aggregate({ _sum: { amount: true }, where: { type: 'income', reconStatus: 'approved' } }),
+    ]);
+
+    const orgTypeCounts = await prisma.organization.groupBy({
+      by: ['isPersonal'],
+      _count: true,
+    });
+
+    const memberCount = await prisma.organizationMember.count({ where: { status: 'active' } });
+    const pendingMemberCount = await prisma.organizationMember.count({ where: { status: 'pending' } });
+
+    res.json({
+      totalUsers: userCount,
+      totalOrganizations: orgCount,
+      personalOrgs: orgTypeCounts.find(o => o.isPersonal)?._count || 0,
+      groupOrgs: orgTypeCounts.find(o => !o.isPersonal)?._count || 0,
+      totalBooks: bookCount,
+      totalTransactions: txnCount,
+      totalExpense: totalExpense._sum.amount || 0,
+      totalIncome: totalIncome._sum.amount || 0,
+      activeMembers: memberCount,
+      pendingMembers: pendingMemberCount,
+    });
+  } catch (error) {
+    console.error('[Admin] Failed to fetch stats:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// --- ADMIN: System status ---
+app.get('/api/admin/system', authenticateAdmin, async (req, res) => {
+  try {
+    let dbOk = false;
+    try {
+      await prisma.$queryRaw`SELECT 1`;
+      dbOk = true;
+    } catch (e) { dbOk = false; }
+
+    const memory = process.memoryUsage();
+    res.json({
+      status: dbOk ? 'healthy' : 'degraded',
+      nodeVersion: process.version,
+      platform: process.platform,
+      uptime: process.uptime(),
+      memory: {
+        rss: Math.round(memory.rss / 1024 / 1024),
+        heapTotal: Math.round(memory.heapTotal / 1024 / 1024),
+        heapUsed: Math.round(memory.heapUsed / 1024 / 1024),
+      },
+      database: dbOk ? 'connected' : 'disconnected',
+      env: process.env.NODE_ENV || 'development',
+      timestamp: new Date().toISOString(),
+    });
+  } catch (error) {
+    console.error('[Admin] Failed to fetch system status:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// --- ADMIN: Reset database (DANGER: deletes all data) ---
+app.post('/api/admin/reset', authenticateAdmin, async (req, res) => {
+  try {
+    // Delete in correct order to respect foreign keys
+    await prisma.transaction.deleteMany();
+    await prisma.book.deleteMany();
+    await prisma.organizationMember.deleteMany();
+    await prisma.organization.deleteMany();
+    await prisma.complaint.deleteMany();
+    await prisma.user.deleteMany();
+    res.json({ message: 'Database reset complete. Seed account will be recreated on restart.' });
+  } catch (error) {
+    console.error('[Admin] Failed to reset database:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
