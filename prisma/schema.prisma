@@ -89,9 +89,6 @@ model Book {
   balance        Float        @default(0)
   organizationId String
   organization   Organization @relation(fields: [organizationId], references: [id])
-  parentBookId   String?
-  parentBook     Book?        @relation("SubBooks", fields: [parentBookId], references: [id])
-  subBooks       Book[]       @relation("SubBooks")
   transactions   Transaction[]
   createdAt      DateTime     @default(now())
 }
@@ -116,7 +113,6 @@ model Transaction {
   dateTime            DateTime @default(now())
   status              String?
   createdById         String?
-  sourceSubBookId     String?
   counterProposedAmount Float?
   counterProposedBy     String?
   chainId             String?

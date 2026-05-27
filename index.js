@@ -854,27 +854,7 @@ const resolveOrgSourceTxnForMirror = async (txn, txClient = prisma) => {
   return null;
 };
 
-// Find mirror transaction in parent book for sub-book sync
-const findMirrorTxn = async (txn, book) => {
-  if (!book.parentBookId) return null;
-  // First try by clientRef
-  if (txn.clientRef) {
-    const mirror = await prisma.transaction.findFirst({
-      where: { bookId: book.parentBookId, clientRef: txn.clientRef }
-    });
-    if (mirror) return mirror;
-  }
-  // Fallback: match by attributes (amount, type, and sourceSubBookId)
-  return prisma.transaction.findFirst({
-    where: {
-      bookId: book.parentBookId,
-      amount: txn.amount,
-      type: txn.type,
-      sourceSubBookId: txn.bookId,
-      note: { contains: `[${book.name}]` }
-    }
-  });
-};
+
 
 // Generate a UUID-like chain ID
 const generateChainId = () => {
@@ -1673,7 +1653,6 @@ app.get('/api/books', authenticateToken, async (req, res) => {
       permissions: [],
       balance: 0.0,
       isDefault: false,
-      parentBookId: null,
       status: 'pending'
     }));
 
@@ -1687,7 +1666,7 @@ app.get('/api/books', authenticateToken, async (req, res) => {
 // Create Book under an organization
 app.post('/api/books', authenticateToken, async (req, res) => {
   try {
-    const { name, organizationId, parentBookId } = req.body;
+    const { name, organizationId } = req.body;
     if (!name || !organizationId) {
       return res.status(400).json({ error: 'Name and organizationId are required' });
     }
@@ -1705,23 +1684,11 @@ app.post('/api/books', authenticateToken, async (req, res) => {
       return res.status(403).json({ error: 'Not a member of this organization' });
     }
 
-    // If parentBookId is provided, verify it exists in same org
-    if (parentBookId) {
-      const parentBook = await prisma.book.findUnique({ where: { id: parentBookId } });
-      if (!parentBook || parentBook.organizationId !== organizationId) {
-        return res.status(400).json({ error: 'Invalid parent book' });
-      }
-      if (!parentBook.isDefault) {
-        return res.status(400).json({ error: 'Sub-books can only be created under the default book' });
-      }
-    }
-
     const book = await prisma.book.create({
       data: {
         name,
         balance: 0.0,
         organizationId,
-        parentBookId: parentBookId || null,
       }
     });
 
@@ -1759,48 +1726,11 @@ app.delete('/api/books/:bookId', authenticateToken, async (req, res) => {
       return res.status(400).json({ error: 'Default book cannot be deleted' });
     }
 
-    // Check if this is a sub-book (has parentBookId)
-    if (book.parentBookId) {
-      const purgeAll = req.query.purge === 'true';
-      const parentBookId = book.parentBookId;
-      if (purgeAll) {
-        // Purge All: Delete sub-book + its mirrored transactions from parent
-        const mirrors = await prisma.transaction.findMany({
-          where: { sourceSubBookId: book.id, bookId: parentBookId }
-        });
-        const mirrorIds = mirrors.map(m => m.id);
-        if (mirrorIds.length > 0) {
-          // Reverse balance for each mirror in parent book
-          let totalBalanceAdj = 0;
-          for (const m of mirrors) {
-            if (m.type === 'expense') totalBalanceAdj += m.amount;
-            else if (m.type === 'income') totalBalanceAdj -= m.amount;
-          }
-          await prisma.$transaction([
-            prisma.transaction.deleteMany({ where: { id: { in: mirrorIds } } }),
-            prisma.book.update({ where: { id: parentBookId }, data: { balance: { increment: totalBalanceAdj } } }),
-            prisma.book.delete({ where: { id: book.id } }),
-          ]);
-        } else {
-          await prisma.$transaction([
-            prisma.transaction.deleteMany({ where: { bookId: book.id } }),
-            prisma.book.delete({ where: { id: book.id } }),
-          ]);
-        }
-      } else {
-        // Keep Data: Delete sub-book only, mirrored transactions stay in parent
-        await prisma.$transaction([
-          prisma.transaction.deleteMany({ where: { bookId: book.id } }),
-          prisma.book.delete({ where: { id: book.id } }),
-        ]);
-      }
-    } else {
-      // Regular book (not a sub-book) — delete everything
-      await prisma.$transaction([
-        prisma.transaction.deleteMany({ where: { bookId: book.id } }),
-        prisma.book.delete({ where: { id: book.id } }),
-      ]);
-    }
+    // Regular book — delete everything
+    await prisma.$transaction([
+      prisma.transaction.deleteMany({ where: { bookId: book.id } }),
+      prisma.book.delete({ where: { id: book.id } }),
+    ]);
 
     broadcast({ type: "data_changed" });
     res.json({ message: 'Book deleted successfully' });
@@ -2272,46 +2202,7 @@ app.post('/api/transactions', authenticateToken, async (req, res) => {
       initialStatus = bypass ? 'approved' : 'pending_org';
     }
 
-    // Mirror to parent book if this is a sub-book
-    if (book.parentBookId) {
-      const mirrorBalanceOp = type === 'income' ? { increment: parsedAmount } : { decrement: parsedAmount };
-      const transactionResult = await prisma.$transaction(async (tx) => {
-        const createdTxn = await tx.transaction.create({
-          data: {
-            bookId,
-            amount: parsedAmount, type, note, category, contact,
-            createdById: req.user.id, reconStatus: initialStatus, imageUrl, clientRef: txnClientRef
-          }
-        });
-        await tx.book.update({ where: { id: bookId }, data: { balance: balanceOp } });
-        await tx.book.update({ where: { id: book.parentBookId }, data: { balance: mirrorBalanceOp } });
-        await tx.transaction.create({
-          data: {
-            bookId: book.parentBookId,
-            amount: parsedAmount,
-            type,
-            note: note ? (note + ' [' + book.name + ']') : ('[' + book.name + ']'),
-            category,
-            contact,
-            createdById: req.user.id,
-            reconStatus: initialStatus,
-            imageUrl,
-            sourceSubBookId: bookId,
-            clientRef: txnClientRef
-          }
-        });
-        await maybeMirrorOrgTxnToCreatorPersonal(tx, {
-          orgTxn: createdTxn,
-          orgBook: book,
-          userId: req.user.id,
-          txnClientRef
-        });
-        return createdTxn;
-      });
-      broadcast({ type: "data_changed" });
-      const enriched = await enrichTxn(transactionResult);
-      return res.status(201).json({ transaction: enriched, book: await prisma.book.findUnique({ where: { id: bookId } }), mirrorBook: await prisma.book.findUnique({ where: { id: book.parentBookId } }) });
-    }
+
 
     const createResult = await prisma.$transaction(async (tx) => {
       const transaction = await tx.transaction.create({
@@ -2404,318 +2295,25 @@ app.put('/api/transactions/:id', authenticateToken, async (req, res) => {
       return res.status(400).json({ error: 'Cannot change recipient on a Send transaction' });
     }
 
-    const user = await prisma.user.findUnique({ where: { id: req.user.id }, select: { name: true } });
-    const requiredApprovers = txn.reconStatus === 'approved'
-      ? await getRequiredApproversForChangeDelete(txn, book, req.user.id)
-      : [];
-    const needsLinkedApproval = requiredApprovers.length > 0;
+    if (txn.pendingAction) {
+      return res.status(400).json({ error: 'Transaction is already pending an approval for edit or delete.' });
+    }
 
-    // Personal org — edit directly when no linked-party approval is required
-    const editOrg = await prisma.organization.findUnique({ where: { id: book.organizationId }, select: { isPersonal: true } });
+    const user = await prisma.user.findUnique({ where: { id: req.user.id }, select: { name: true } });
+    const requiredApprovers = await getRequiredApproversForChangeDelete(txn, book, req.user.id);
+    const needsLinkedApproval = requiredApprovers.length > 0;
     const isManualIncome = txn.type === 'income' && !txn.linkedTransactionId;
-    if ((editOrg?.isPersonal || isManualIncome) && (txn.reconStatus !== 'approved' || !needsLinkedApproval)) {
-      // Personal book or manual income: direct update; skip balance adj on rejected (reject already restored)
-      let personalBalAdj = 0;
+
+    if (!needsLinkedApproval || isManualIncome) {
+      // Direct edit logic
+      let balanceAdjustment = 0;
       if (
         txn.reconStatus !== 'rejected' &&
         changes.amount !== undefined &&
         changes.amount !== txn.amount
       ) {
-        if (txn.type === 'expense') personalBalAdj = txn.amount - parsedAmount;
-        else if (txn.type === 'income') personalBalAdj = parsedAmount - txn.amount;
-      }
-      const personalUpdated = await prisma.$transaction(async (prisma) => {
-        const updatedTxn = await prisma.transaction.update({
-          where: { id: txnId },
-          data: { ...changes, updateHistory: [...(txn.updateHistory || []), { timestamp: new Date().toISOString(), userId: req.user.id, userName: user?.name || 'Unknown', action: 'edit', changes: { old: { amount: txn.amount, type: txn.type, note: txn.note }, new: changes } }] },
-        });
-        if (personalBalAdj !== 0) {
-          await prisma.book.update({ where: { id: book.id }, data: { balance: { increment: personalBalAdj } } });
-        }
-
-        // Sub-book mirror check
-        const mirror = await findMirrorTxn(txn, book);
-        if (mirror) {
-          const mirrorChanges = { ...changes };
-          if (changes.note !== undefined) {
-            mirrorChanges.note = changes.note ? (changes.note + ' [' + book.name + ']') : ('[' + book.name + ']');
-          }
-          await prisma.transaction.update({
-            where: { id: mirror.id },
-            data: mirrorChanges
-          });
-          if (personalBalAdj !== 0) {
-            await prisma.book.update({ where: { id: book.parentBookId }, data: { balance: { increment: personalBalAdj } } });
-          }
-        }
-
-        // Sync linked transaction on direct edit when no multi-party approval is needed
-        if (txn.linkedTransactionId && !needsLinkedApproval) {
-          const linkedTxn = await prisma.transaction.findUnique({ where: { id: txn.linkedTransactionId } });
-          if (linkedTxn) {
-            const linkedChanges = {};
-            if (changes.amount !== undefined) linkedChanges.amount = parsedAmount;
-            if (changes.note !== undefined) linkedChanges.note = changes.note;
-            if (Object.keys(linkedChanges).length > 0) {
-              let linkedBalAdj = 0;
-              if (changes.amount !== undefined && changes.amount !== linkedTxn.amount) {
-                if (linkedTxn.type === 'income') linkedBalAdj = parsedAmount - linkedTxn.amount;
-                else if (linkedTxn.type === 'expense') linkedBalAdj = linkedTxn.amount - parsedAmount;
-              }
-              await prisma.transaction.update({
-                where: { id: txn.linkedTransactionId },
-                data: {
-                  ...linkedChanges,
-                  updateHistory: [
-                    ...(linkedTxn.updateHistory || []),
-                    { timestamp: new Date().toISOString(), userId: req.user.id, userName: user?.name || 'Unknown', action: 'edit (linked)', changes: { old: { amount: linkedTxn.amount, note: linkedTxn.note }, new: linkedChanges } },
-                  ],
-                },
-              });
-              if (linkedBalAdj !== 0) {
-                const linkedBook = await prisma.book.findUnique({ where: { id: linkedTxn.bookId } });
-                if (linkedBook) {
-                  await prisma.book.update({ where: { id: linkedTxn.bookId }, data: { balance: { increment: linkedBalAdj } } });
-                }
-              }
-            }
-          }
-        }
-
-        return updatedTxn;
-      });
-      broadcast({ type: 'data_changed' });
-      const enrichedPersonal = await enrichTxn(personalUpdated);
-      return res.json({ transaction: enrichedPersonal, message: 'Transaction updated' });
-    } else if (txn.reconStatus === 'approved') {
-      if (!needsLinkedApproval) {
-        let balanceAdjustment = 0;
-        if (changes.amount !== undefined && changes.amount !== txn.amount) {
-          if (txn.type === 'expense') balanceAdjustment = txn.amount - parsedAmount;
-          else if (txn.type === 'income') balanceAdjustment = parsedAmount - txn.amount;
-        }
-        const updated = await prisma.$transaction(async (prisma) => {
-          const updatedTxn = await prisma.transaction.update({
-            where: { id: txnId },
-            data: {
-              ...changes,
-              updateHistory: [
-                ...(txn.updateHistory || []),
-                {
-                  timestamp: new Date().toISOString(),
-                  userId: req.user.id,
-                  userName: user?.name || 'Unknown',
-                  action: 'edit',
-                  changes: { old: { amount: txn.amount, type: txn.type, category: txn.category, note: txn.note }, new: changes },
-                },
-              ],
-            },
-          });
-          if (balanceAdjustment !== 0) {
-            await prisma.book.update({ where: { id: book.id }, data: { balance: { increment: balanceAdjustment } } });
-          }
-          if (txn.linkedTransactionId) {
-            const linkedTxn = await prisma.transaction.findUnique({ where: { id: txn.linkedTransactionId } });
-            if (linkedTxn) {
-              const linkedChanges = {};
-              if (changes.amount !== undefined) linkedChanges.amount = parsedAmount;
-              if (changes.note !== undefined) linkedChanges.note = changes.note;
-              if (Object.keys(linkedChanges).length > 0) {
-                let linkedBalAdj = 0;
-                if (changes.amount !== undefined && changes.amount !== linkedTxn.amount) {
-                  if (linkedTxn.type === 'income') linkedBalAdj = parsedAmount - linkedTxn.amount;
-                  else if (linkedTxn.type === 'expense') linkedBalAdj = linkedTxn.amount - parsedAmount;
-                }
-                await prisma.transaction.update({
-                  where: { id: txn.linkedTransactionId },
-                  data: {
-                    ...linkedChanges,
-                    updateHistory: [
-                      ...(linkedTxn.updateHistory || []),
-                      { timestamp: new Date().toISOString(), userId: req.user.id, userName: user?.name || 'Unknown', action: 'edit (linked)', changes: { old: { amount: linkedTxn.amount, note: linkedTxn.note }, new: linkedChanges } },
-                    ],
-                  },
-                });
-                if (linkedBalAdj !== 0) {
-                  await prisma.book.update({ where: { id: linkedTxn.bookId }, data: { balance: { increment: linkedBalAdj } } });
-                }
-              }
-            }
-          }
-          const mirror = await findMirrorTxn(txn, book);
-          if (mirror) {
-            const mirrorChanges = {};
-            if (changes.amount !== undefined) mirrorChanges.amount = parsedAmount;
-            if (changes.note !== undefined) {
-              mirrorChanges.note = changes.note ? (changes.note + ' [' + book.name + ']') : ('[' + book.name + ']');
-            }
-            if (Object.keys(mirrorChanges).length > 0) {
-              await prisma.transaction.update({ where: { id: mirror.id }, data: mirrorChanges });
-            }
-            if (balanceAdjustment !== 0) {
-              await prisma.book.update({ where: { id: book.parentBookId }, data: { balance: { increment: balanceAdjustment } } });
-            }
-          }
-          return updatedTxn;
-        });
-        broadcast({ type: 'data_changed' });
-        const enriched = await enrichTxn(updated);
-        return res.json({ transaction: enriched, message: 'Transaction updated' });
-      }
-
-      // Reverse current balance to compute the pre-txn balance
-      let preTxnBalance = book.balance;
-      if (txn.type === 'expense') {
-        preTxnBalance += txn.amount;
-      } else if (txn.type === 'income') {
-        preTxnBalance -= txn.amount;
-      }
-
-      // Store old data for potential revert
-      const pendingData = await buildChangeDeletePendingData(txn, book, req.user.id, {
-        oldAmount: txn.amount,
-        oldType: txn.type,
-        oldCategory: txn.category,
-        oldNote: txn.note,
-        oldRecipientUserId: txn.recipientUserId,
-        newAmount: changes.amount !== undefined ? parsedAmount : txn.amount,
-        newNote: changes.note !== undefined ? changes.note : txn.note,
-        newCategory: changes.category !== undefined ? changes.category : txn.category,
-      });
-
-      // Update transaction: apply changes, set to pending
-      const updated = await prisma.$transaction(async (prisma) => {
-        const updatedTxn = await prisma.transaction.update({
-          where: { id: txnId },
-          data: {
-            ...changes,
-            reconStatus: 'pending',
-            pendingAction: 'edit',
-            pendingData,
-            updateHistory: [
-              ...(txn.updateHistory || []),
-              {
-                timestamp: new Date().toISOString(),
-                userId: req.user.id,
-                userName: user?.name || 'Unknown',
-                action: 'edit',
-                changes: { old: { amount: txn.amount, type: txn.type, category: txn.category, note: txn.note }, new: changes },
-              },
-            ],
-          },
-        });
-
-        await prisma.book.update({
-          where: { id: book.id },
-          data: { balance: preTxnBalance },
-        });
-
-        // If linked transaction exists, also set it to pending
-        if (txn.linkedTransactionId) {
-          const linkedTxn = await prisma.transaction.findUnique({ where: { id: txn.linkedTransactionId } });
-          if (linkedTxn && linkedTxn.reconStatus === 'approved') {
-            const linkedBalanceOp = linkedTxn.type === 'income'
-              ? { decrement: linkedTxn.amount }
-              : { increment: linkedTxn.amount };
-            await prisma.book.update({
-              where: { id: linkedTxn.bookId },
-              data: { balance: linkedBalanceOp },
-            });
-
-            const linkedChanges = {};
-            if (changes.amount !== undefined) linkedChanges.amount = parsedAmount;
-            if (changes.note !== undefined) linkedChanges.note = note;
-
-            await prisma.transaction.update({
-              where: { id: txn.linkedTransactionId },
-              data: {
-                ...linkedChanges,
-                reconStatus: 'pending',
-                pendingAction: 'edit',
-                pendingData,
-                updateHistory: [
-                  ...(linkedTxn.updateHistory || []),
-                  {
-                    timestamp: new Date().toISOString(),
-                    userId: req.user.id,
-                    userName: user?.name || 'Unknown',
-                    action: 'edit (linked)',
-                    changes: { old: { amount: linkedTxn.amount, note: linkedTxn.note }, new: linkedChanges },
-                  },
-                ],
-              },
-            });
-          }
-        }
-
-        // Sync to sub-book parent mirror transaction if it exists
-        const mirror = await findMirrorTxn(txn, book);
-        if (mirror) {
-          if (mirror.reconStatus === 'approved') {
-            const mirrorBalanceOp = mirror.type === 'income'
-              ? { decrement: mirror.amount }
-              : { increment: mirror.amount };
-            await prisma.book.update({
-              where: { id: book.parentBookId },
-              data: { balance: mirrorBalanceOp }
-            });
-
-            const mirrorChanges = {};
-            if (changes.amount !== undefined) mirrorChanges.amount = parsedAmount;
-            if (changes.note !== undefined) {
-              mirrorChanges.note = changes.note ? (changes.note + ' [' + book.name + ']') : ('[' + book.name + ']');
-            }
-
-            await prisma.transaction.update({
-              where: { id: mirror.id },
-              data: {
-                ...mirrorChanges,
-                reconStatus: 'pending',
-                pendingAction: 'edit',
-                pendingData: {
-                  oldAmount: mirror.amount,
-                  oldType: mirror.type,
-                  oldCategory: mirror.category,
-                  oldNote: mirror.note,
-                  requestedBy: req.user.id
-                },
-                updateHistory: [
-                  ...(mirror.updateHistory || []),
-                  {
-                    timestamp: new Date().toISOString(),
-                    userId: req.user.id,
-                    userName: user?.name || 'Unknown',
-                    action: 'edit (mirror)',
-                    changes: { old: { amount: mirror.amount, note: mirror.note }, new: mirrorChanges }
-                  }
-                ]
-              }
-            });
-          }
-        }
-
-        return updatedTxn;
-      });
-
-      broadcast({ type: 'data_changed' });
-      await notifyChangeDeleteApprovers(updated, 'edit', pendingData);
-      const enriched = await enrichTxn(updated);
-      const summary = buildChangeDeleteNotification(pendingData, 'edit', updated);
-      return res.json({
-        transaction: enriched,
-        message: 'Edit submitted for approval',
-        notification: summary,
-      });
-    } else {
-      // Not approved — update directly with no approval needed
-      // Balance may need adjustment if amount changed
-      let balanceAdjustment = 0;
-      if (changes.amount !== undefined && changes.amount !== txn.amount) {
-        if (txn.type === 'expense') {
-          balanceAdjustment = txn.amount - parsedAmount;
-        } else if (txn.type === 'income') {
-          balanceAdjustment = parsedAmount - txn.amount;
-        }
+        if (txn.type === 'expense') balanceAdjustment = txn.amount - parsedAmount;
+        else if (txn.type === 'income') balanceAdjustment = parsedAmount - txn.amount;
       }
 
       const updated = await prisma.$transaction(async (prisma) => {
@@ -2737,68 +2335,145 @@ app.put('/api/transactions/:id', authenticateToken, async (req, res) => {
         });
 
         if (balanceAdjustment !== 0) {
-          await prisma.book.update({
-            where: { id: book.id },
-            data: { balance: { increment: balanceAdjustment } },
-          });
+          await prisma.book.update({ where: { id: book.id }, data: { balance: { increment: balanceAdjustment } } });
         }
 
-        // Update linked transaction for pending Send txns too
         if (txn.linkedTransactionId) {
           const linkedTxn = await prisma.transaction.findUnique({ where: { id: txn.linkedTransactionId } });
-          if (linkedTxn && linkedTxn.reconStatus === 'pending') {
+          if (linkedTxn) {
             const linkedChanges = {};
             if (changes.amount !== undefined) linkedChanges.amount = parsedAmount;
-            if (changes.note !== undefined) linkedChanges.note = note;
+            if (changes.note !== undefined) linkedChanges.note = changes.note;
             if (Object.keys(linkedChanges).length > 0) {
+              let linkedBalAdj = 0;
+              if (linkedTxn.reconStatus !== 'rejected' && changes.amount !== undefined && changes.amount !== linkedTxn.amount) {
+                if (linkedTxn.type === 'income') linkedBalAdj = parsedAmount - linkedTxn.amount;
+                else if (linkedTxn.type === 'expense') linkedBalAdj = linkedTxn.amount - parsedAmount;
+              }
               await prisma.transaction.update({
                 where: { id: txn.linkedTransactionId },
                 data: {
                   ...linkedChanges,
                   updateHistory: [
                     ...(linkedTxn.updateHistory || []),
-                    {
-                      timestamp: new Date().toISOString(),
-                      userId: req.user.id,
-                      userName: user?.name || 'Unknown',
-                      action: 'edit (linked)',
-                      changes: { old: { amount: linkedTxn.amount, note: linkedTxn.note }, new: linkedChanges },
-                    },
+                    { timestamp: new Date().toISOString(), userId: req.user.id, userName: user?.name || 'Unknown', action: 'edit (linked)', changes: { old: { amount: linkedTxn.amount, note: linkedTxn.note }, new: linkedChanges } },
                   ],
                 },
               });
+              if (linkedBalAdj !== 0) {
+                await prisma.book.update({ where: { id: linkedTxn.bookId }, data: { balance: { increment: linkedBalAdj } } });
+              }
             }
           }
         }
 
-        // Sync to sub-book parent mirror transaction if it exists
-        const mirror = await findMirrorTxn(txn, book);
-        if (mirror) {
-          const mirrorChanges = {};
-          if (changes.amount !== undefined) mirrorChanges.amount = parsedAmount;
-          if (changes.note !== undefined) {
-            mirrorChanges.note = changes.note ? (changes.note + ' [' + book.name + ']') : ('[' + book.name + ']');
-          }
-          if (Object.keys(mirrorChanges).length > 0) {
-            await prisma.transaction.update({
-              where: { id: mirror.id },
-              data: mirrorChanges
-            });
-          }
-          if (balanceAdjustment !== 0) {
-            await prisma.book.update({
-              where: { id: book.parentBookId },
-              data: { balance: { increment: balanceAdjustment } }
-            });
-          }
-        }
+
 
         return updatedTxn;
       });
 
-      broadcast({ type: "data_changed" });
-      const enriched2 = await enrichTxn(updated);
-      return res.json({ transaction: enriched2, message: 'Transaction updated' });
+      broadcast({ type: 'data_changed' });
+      const enriched = await enrichTxn(updated);
+      return res.json({ transaction: enriched, message: 'Transaction updated' });
+    } else {
+      // Pending edit request flow
+      let preTxnBalance = book.balance;
+      if (txn.type === 'expense') {
+        preTxnBalance += txn.amount;
+      } else if (txn.type === 'income') {
+        preTxnBalance -= txn.amount;
+      }
+
+      const pendingData = await buildChangeDeletePendingData(txn, book, req.user.id, {
+        oldAmount: txn.amount,
+        oldType: txn.type,
+        oldCategory: txn.category,
+        oldNote: txn.note,
+        oldRecipientUserId: txn.recipientUserId,
+        oldLinkedTransactionId: txn.linkedTransactionId,
+        oldOrgFundId: txn.orgFundId,
+        newAmount: changes.amount !== undefined ? parsedAmount : txn.amount,
+        newNote: changes.note !== undefined ? changes.note : txn.note,
+        newCategory: changes.category !== undefined ? changes.category : txn.category,
+      });
+
+      const updated = await prisma.$transaction(async (prisma) => {
+        const updatedTxn = await prisma.transaction.update({
+          where: { id: txnId },
+          data: {
+            ...changes,
+            reconStatus: 'pending',
+            pendingAction: 'edit',
+            pendingData,
+            updateHistory: [
+              ...(txn.updateHistory || []),
+              {
+                timestamp: new Date().toISOString(),
+                userId: req.user.id,
+                userName: user?.name || 'Unknown',
+                action: 'edit_request',
+                changes: { old: { amount: txn.amount, type: txn.type, category: txn.category, note: txn.note }, new: changes },
+              },
+            ],
+          },
+        });
+
+        await prisma.book.update({
+          where: { id: book.id },
+          data: { balance: preTxnBalance },
+        });
+
+        if (txn.linkedTransactionId) {
+          const linkedTxn = await prisma.transaction.findUnique({ where: { id: txn.linkedTransactionId } });
+          if (linkedTxn) {
+            const linkedBalanceOp = linkedTxn.type === 'income'
+              ? { decrement: linkedTxn.amount }
+              : { increment: linkedTxn.amount };
+            await prisma.book.update({
+              where: { id: linkedTxn.bookId },
+              data: { balance: linkedBalanceOp },
+            });
+
+            const linkedChanges = {};
+            if (changes.amount !== undefined) linkedChanges.amount = parsedAmount;
+            if (changes.note !== undefined) linkedChanges.note = changes.note;
+
+            await prisma.transaction.update({
+              where: { id: txn.linkedTransactionId },
+              data: {
+                ...linkedChanges,
+                reconStatus: 'pending',
+                pendingAction: 'edit',
+                pendingData,
+                updateHistory: [
+                  ...(linkedTxn.updateHistory || []),
+                  {
+                    timestamp: new Date().toISOString(),
+                    userId: req.user.id,
+                    userName: user?.name || 'Unknown',
+                    action: 'edit_request (linked)',
+                    changes: { old: { amount: linkedTxn.amount, note: linkedTxn.note }, new: linkedChanges },
+                  },
+                ],
+              },
+            });
+          }
+        }
+
+
+
+        return updatedTxn;
+      });
+
+      broadcast({ type: 'data_changed' });
+      await notifyChangeDeleteApprovers(updated, 'edit', pendingData);
+      const enriched = await enrichTxn(updated);
+      const summary = buildChangeDeleteNotification(pendingData, 'edit', updated);
+      return res.json({
+        transaction: enriched,
+        message: 'Edit submitted for approval',
+        notification: summary,
+      });
     }
   } catch (error) {
     console.error('Edit transaction error:', error);
@@ -3010,10 +2685,11 @@ app.delete('/api/transactions/:id', authenticateToken, async (req, res) => {
 
     const user = await prisma.user.findUnique({ where: { id: req.user.id }, select: { name: true } });
     const org = await prisma.organization.findUnique({ where: { id: book.organizationId }, select: { isPersonal: true } });
+    if (txn.pendingAction === 'delete') {
+      return res.status(400).json({ error: 'Deletion is already pending approval' });
+    }
     const isManualIncome = txn.type === 'income' && !txn.linkedTransactionId;
-    const requiredApprovers = txn.reconStatus === 'approved'
-      ? await getRequiredApproversForChangeDelete(txn, book, req.user.id)
-      : [];
+    const requiredApprovers = await getRequiredApproversForChangeDelete(txn, book, req.user.id);
 
     const executeHardDelete = async () => {
       await prisma.$transaction(async (prisma) => {
@@ -3038,152 +2714,108 @@ app.delete('/api/transactions/:id', authenticateToken, async (req, res) => {
             await prisma.transaction.delete({ where: { id: linked.id } });
           }
         }
-        const mirror = await findMirrorTxn(txn, book);
-        if (mirror) {
-          let mirrorAdj = mirror.type === 'income' ? -mirror.amount : mirror.amount;
-          await prisma.book.update({ where: { id: book.parentBookId }, data: { balance: { increment: mirrorAdj } } });
-          await prisma.transaction.delete({ where: { id: mirror.id } });
-        }
+
         await prisma.transaction.delete({ where: { id: txnId } });
       });
       broadcast({ type: 'data_changed' });
     };
 
     // Manual personal income or no linked parties — delete immediately
-    if (isManualIncome || (txn.reconStatus === 'approved' && requiredApprovers.length === 0)) {
+    if (isManualIncome || requiredApprovers.length === 0) {
       await executeHardDelete();
       return res.json({ message: 'Transaction deleted' });
     }
 
-    if (txn.reconStatus === 'approved') {
-      let reversedBalance = book.balance;
-      if (txn.type === 'expense') {
-        reversedBalance += txn.amount;
-      } else if (txn.type === 'income') {
-        reversedBalance -= txn.amount;
+    // Linked transaction/requires approval: transition to pending delete
+    let reversedBalance = book.balance;
+    if (txn.type === 'expense') {
+      reversedBalance += txn.amount;
+    } else if (txn.type === 'income') {
+      reversedBalance -= txn.amount;
+    }
+
+    const pendingData = await buildChangeDeletePendingData(txn, book, req.user.id, {
+      oldAmount: txn.amount,
+      oldType: txn.type,
+      oldCategory: txn.category,
+      oldNote: txn.note,
+      oldRecipientUserId: txn.recipientUserId,
+      oldLinkedTransactionId: txn.linkedTransactionId,
+      oldOrgFundId: txn.orgFundId,
+    });
+
+    await prisma.$transaction(async (prisma) => {
+      await prisma.transaction.update({
+        where: { id: txnId },
+        data: {
+          reconStatus: 'pending',
+          pendingAction: 'delete',
+          pendingData,
+          updateHistory: [
+            ...(txn.updateHistory || []),
+            {
+              timestamp: new Date().toISOString(),
+              userId: req.user.id,
+              userName: user?.name || 'Unknown',
+              action: 'delete_request',
+              changes: { old: { amount: txn.amount, type: txn.type, category: txn.category, note: txn.note } },
+            },
+          ],
+        },
+      });
+
+      await prisma.book.update({
+        where: { id: book.id },
+        data: { balance: reversedBalance },
+      });
+
+      // Also set linked transaction to pending
+      if (txn.linkedTransactionId) {
+        const linkedTxn = await prisma.transaction.findUnique({ where: { id: txn.linkedTransactionId } });
+        if (linkedTxn) {
+          const linkedBook = await prisma.book.findUnique({ where: { id: linkedTxn.bookId } });
+          if (linkedBook) {
+            let linkedReversed = linkedBook.balance;
+            if (linkedTxn.type === 'income') {
+              linkedReversed -= linkedTxn.amount;
+            } else if (linkedTxn.type === 'expense') {
+              linkedReversed += linkedTxn.amount;
+            }
+            await prisma.book.update({
+              where: { id: linkedTxn.bookId },
+              data: { balance: linkedReversed },
+            });
+          }
+
+          await prisma.transaction.update({
+            where: { id: txn.linkedTransactionId },
+            data: {
+              reconStatus: 'pending',
+              pendingAction: 'delete',
+              pendingData,
+              updateHistory: [
+                ...(linkedTxn.updateHistory || []),
+                {
+                  timestamp: new Date().toISOString(),
+                  userId: req.user.id,
+                  userName: user?.name || 'Unknown',
+                  action: 'delete_request (linked)',
+                  changes: { old: { amount: linkedTxn.amount, type: linkedTxn.type, category: linkedTxn.category, note: linkedTxn.note } },
+                },
+              ],
+            },
+          });
+        }
       }
 
-      const pendingData = await buildChangeDeletePendingData(txn, book, req.user.id, {
-        oldAmount: txn.amount,
-        oldType: txn.type,
-        oldCategory: txn.category,
-        oldNote: txn.note,
-        oldRecipientUserId: txn.recipientUserId,
-        oldLinkedTransactionId: txn.linkedTransactionId,
-        oldOrgFundId: txn.orgFundId,
-      });
 
-      await prisma.$transaction(async (prisma) => {
-        await prisma.transaction.update({
-          where: { id: txnId },
-          data: {
-            reconStatus: 'pending',
-            pendingAction: 'delete',
-            pendingData,
-            updateHistory: [
-              ...(txn.updateHistory || []),
-              {
-                timestamp: new Date().toISOString(),
-                userId: req.user.id,
-                userName: user?.name || 'Unknown',
-                action: 'delete_request',
-                changes: { old: { amount: txn.amount, type: txn.type, category: txn.category, note: txn.note } },
-              },
-            ],
-          },
-        });
+    });
 
-        await prisma.book.update({
-          where: { id: book.id },
-          data: { balance: reversedBalance },
-        });
-
-        // Also set linked transaction to pending
-        if (txn.linkedTransactionId) {
-          const linkedTxn = await prisma.transaction.findUnique({ where: { id: txn.linkedTransactionId } });
-          if (linkedTxn && linkedTxn.reconStatus === 'approved') {
-            const linkedBook = await prisma.book.findUnique({ where: { id: linkedTxn.bookId } });
-            if (linkedBook) {
-              let linkedReversed = linkedBook.balance;
-              if (linkedTxn.type === 'income') {
-                linkedReversed -= linkedTxn.amount;
-              } else if (linkedTxn.type === 'expense') {
-                linkedReversed += linkedTxn.amount;
-              }
-              await prisma.book.update({
-                where: { id: linkedTxn.bookId },
-                data: { balance: linkedReversed },
-              });
-            }
-
-            await prisma.transaction.update({
-              where: { id: txn.linkedTransactionId },
-              data: {
-                reconStatus: 'pending',
-                pendingAction: 'delete',
-                pendingData,
-                updateHistory: [
-                  ...(linkedTxn.updateHistory || []),
-                  {
-                    timestamp: new Date().toISOString(),
-                    userId: req.user.id,
-                    userName: user?.name || 'Unknown',
-                    action: 'delete_request (linked)',
-                    changes: { old: { amount: linkedTxn.amount, type: linkedTxn.type, category: linkedTxn.category, note: linkedTxn.note } },
-                  },
-                ],
-              },
-            });
-          }
-        }
-
-        // Sync deletion to parent sub-book mirror transaction if it exists
-        const mirror = await findMirrorTxn(txn, book);
-        if (mirror) {
-          if (mirror.reconStatus === 'approved') {
-            let mirrorReversed = mirror.type === 'income' ? -mirror.amount : mirror.amount;
-            await prisma.book.update({
-              where: { id: book.parentBookId },
-              data: { balance: { increment: mirrorReversed } },
-            });
-
-            await prisma.transaction.update({
-              where: { id: mirror.id },
-              data: {
-                reconStatus: 'pending',
-                pendingAction: 'delete',
-                pendingData: {
-                  oldAmount: mirror.amount,
-                  oldType: mirror.type,
-                  oldCategory: mirror.category,
-                  oldNote: mirror.note,
-                  requestedBy: req.user.id,
-                },
-                updateHistory: [
-                  ...(mirror.updateHistory || []),
-                  {
-                    timestamp: new Date().toISOString(),
-                    userId: req.user.id,
-                    userName: user?.name || 'Unknown',
-                    action: 'delete_request (mirror)',
-                    changes: { old: { amount: mirror.amount, type: mirror.type, category: mirror.category, note: mirror.note } },
-                  },
-                ],
-              },
-            });
-          }
-        }
-      });
-
-      broadcast({ type: 'data_changed' });
-      const refreshedTxn = await prisma.transaction.findUnique({ where: { id: txnId } });
-      await notifyChangeDeleteApprovers(refreshedTxn || txn, 'delete', pendingData);
-      const summary = buildChangeDeleteNotification(pendingData, 'delete', refreshedTxn || txn);
-      return res.json({ message: 'Delete request submitted for approval', notification: summary });
-    } else {
-      await executeHardDelete();
-      return res.json({ message: 'Transaction deleted' });
-    }
+    broadcast({ type: 'data_changed' });
+    const refreshedTxn = await prisma.transaction.findUnique({ where: { id: txnId } });
+    await notifyChangeDeleteApprovers(refreshedTxn || txn, 'delete', pendingData);
+    const summary = buildChangeDeleteNotification(pendingData, 'delete', refreshedTxn || txn);
+    return res.json({ message: 'Delete request submitted for approval', notification: summary });
   } catch (error) {
     console.error('Delete transaction error:', error);
     res.status(500).json({ error: 'Server error deleting transaction' });
@@ -3442,25 +3074,7 @@ app.post('/api/transactions/:id/action', authenticateToken, async (req, res) => 
               }
             }
 
-            // Sync approval to parent sub-book mirror transaction
-            const mirror = await findMirrorTxn(txn, txnBook);
-            if (mirror) {
-              const mirrorCurrent = await tx.transaction.findUnique({ where: { id: mirror.id }, select: { version: true } });
-              if (mirrorCurrent) {
-                await tx.transaction.updateMany({
-                  where: { id: mirror.id, version: mirrorCurrent.version },
-                  data: { reconStatus: 'approved', pendingAction: null, pendingData: null, version: { increment: 1 } }
-                });
-                const updatedMirror = await tx.transaction.findUnique({ where: { id: mirror.id } });
-                if (updatedMirror) {
-                  const mirrorDelta = updatedMirror.type === 'expense' ? -updatedMirror.amount : updatedMirror.amount;
-                  await tx.book.update({
-                    where: { id: txnBook.parentBookId },
-                    data: { balance: { increment: mirrorDelta } }
-                  });
-                }
-              }
-            }
+
 
             // Apply the new amount effect using increment/decrement (GAP 2.3 fix)
             const updated = await tx.transaction.findUnique({ where: { id: txnId } });
@@ -3506,11 +3120,7 @@ app.post('/api/transactions/:id/action', authenticateToken, async (req, res) => 
               }
             }
 
-            // Sync deletion to parent sub-book mirror transaction if it exists
-            const mirror = await findMirrorTxn(txn, txnBook);
-            if (mirror) {
-              await tx.transaction.delete({ where: { id: mirror.id } });
-            }
+
 
             await tx.transaction.delete({ where: { id: txnId } });
           });
@@ -3837,7 +3447,8 @@ app.post('/api/transactions/:id/action', authenticateToken, async (req, res) => 
       // REJECT
       if (txn.pendingAction) {
         const pd = txn.pendingData;
-        if (pd) {
+        const book = await prisma.book.findUnique({ where: { id: txn.bookId } });
+        if (pd && book) {
           await prisma.$transaction(async (tx) => {
             // Restore balance using increment/decrement (GAP 2.3 fix)
             const balanceDelta = pd.oldType === 'expense' ? -pd.oldAmount : pd.oldAmount;
@@ -3879,6 +3490,8 @@ app.post('/api/transactions/:id/action', authenticateToken, async (req, res) => 
                 }
               }
             }
+
+
           });
         }
         broadcast({ type: "data_changed" });
@@ -3991,6 +3604,8 @@ app.post('/api/transactions/:id/action', authenticateToken, async (req, res) => 
             }
           }
         }
+
+
 
         const orgSource = await resolveOrgSourceTxnForMirror(txn, tx);
         if (orgSource && orgSource.chainType !== 'fund_send') {
@@ -4125,6 +3740,8 @@ app.post('/api/transactions/:id/retry', authenticateToken, async (req, res) => {
       }
       }
 
+
+
       // Re-apply balance (reject had reversed it) for non-send expenses
       if (!isSend) {
         const balanceDelta = txn.type === 'expense' ? -txn.amount : txn.amount;
@@ -4132,6 +3749,8 @@ app.post('/api/transactions/:id/retry', authenticateToken, async (req, res) => {
           where: { id: txn.bookId },
           data: { balance: { increment: balanceDelta } }
         });
+
+
 
         // Bypass on fund org: mirror expense into org book (same as create voucher flow)
         if (bypassOrgApproval && newStatus === 'approved' && txn.orgFundId) {
