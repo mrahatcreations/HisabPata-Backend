@@ -108,19 +108,14 @@ app.use((req, res, next) => {
 });
 
 // Healthcheck endpoint (no auth required)
-app.get('/api/health', (_req, res) => res.json({ status: 'ok' }));
-
-// Debug: admin key check (only in dev)
-if (process.env.NODE_ENV !== 'production') {
-  app.get('/api/debug/admin-key', (_req, res) => {
-    const key = (process.env.ADMIN_KEY || '').trim();
-    res.json({
-      set: !!process.env.ADMIN_KEY,
-      length: key.length,
-      prefix: key.length > 0 ? key[0] + '***' + key[key.length - 1] : 'empty',
-    });
+app.get('/api/health', (_req, res) => {
+  const adminKey = (process.env.ADMIN_KEY || '').trim();
+  res.json({
+    status: 'ok',
+    adminKeySet: !!process.env.ADMIN_KEY,
+    adminKeyLength: adminKey.length,
   });
-}
+});
 
 // Middleware: Authenticate JWT Token
 const authenticateToken = (req, res, next) => {
