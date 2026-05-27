@@ -5977,11 +5977,26 @@ app.post('/api/ai/execute', authenticateToken, async (req, res) => {
     }
 
     if (action === 'create_transaction') {
-      const { bookId, type, amount, category, note, description, dateTime, contact, recipientUserId, orgFundId } = data;
+      const { bookId, type, amount, category, note, description, dateTime, contact, recipientUserId, orgFundId, audioNoteId } = data;
       const resolvedNote = (note || description || '').trim();
 
       if (!bookId || !type || !amount) {
         return res.status(400).json({ error: 'Missing required transaction fields' });
+      }
+
+      if (audioNoteId) {
+        res.on('finish', async () => {
+          if (res.statusCode === 200) {
+            try {
+              await prisma.audioNote.update({
+                where: { id: audioNoteId },
+                data: { status: 'completed' }
+              });
+            } catch (e) {
+              console.error('Failed to update audio note:', e);
+            }
+          }
+        });
       }
 
       const book = await prisma.book.findFirst({
