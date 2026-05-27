@@ -20,6 +20,20 @@ const prisma = new PrismaClient({ adapter });
 const app = express();
 const PORT = process.env.PORT || 8000;
 
+const DEFAULT_CATEGORIES = [
+  'expense:Send',
+  'expense:Transport',
+  'expense:Mobile Recharge',
+  'expense:Postage',
+  'expense:Publication',
+  'expense:Office Stationery',
+  'expense:Tips',
+  'expense:Donation',
+  'expense:Others',
+  'income:Salary',
+  'income:Others'
+];
+
 const uploadDir = path.join(__dirname, 'uploads');
 if (!fs.existsSync(uploadDir)) {
   fs.mkdirSync(uploadDir, { recursive: true });
@@ -42,7 +56,7 @@ const upload = multer({
     const filetypes = /jpeg|jpg|png|gif|webp|mp4|mov|avi|mkv|quicktime/;
     const mimetype = filetypes.test(file.mimetype);
     const extname = filetypes.test(path.extname(file.originalname).toLowerCase());
-    
+
     if (mimetype || extname) {
       return cb(null, true);
     }
@@ -109,7 +123,7 @@ const authenticateToken = (req, res, next) => {
     if (err) {
       return res.status(403).json({ error: 'Invalid or expired token' });
     }
-    
+
     try {
       // Security Hardening: check tokenVersion in database to support revocation
       const dbUser = await prisma.user.findUnique({ where: { id: decoded.id } });
@@ -145,11 +159,11 @@ app.post('/api/upload', authenticateToken, (req, res) => {
     } else if (err) {
       return res.status(400).json({ error: err.message });
     }
-    
+
     if (!req.file) {
       return res.status(400).json({ error: 'No file uploaded' });
     }
-    
+
     // Return relative URL path
     const fileUrl = `/uploads/${req.file.filename}`;
     res.json({ imageUrl: fileUrl });
@@ -206,7 +220,7 @@ const checkApprovalBypass = async (orgId, userId) => {
   ]);
   if (!org || org.isPersonal) return true; // Personal orgs always bypass
   if (!membership || membership.status !== 'active') return false;
-  
+
   // Admins and Editors (has edit_all permission or editor role) bypass approval
   if (membership.role === 'admin' || membership.role === 'editor' || (membership.permissions || []).includes('edit_all')) {
     return true;
@@ -356,7 +370,46 @@ async function enrichTxn(txn) {
     creatorName = u?.name || null;
     creatorAvatarUrl = u?.avatarUrl || null;
   }
-  return { ...txn, recipientName, fundName, creatorName, creatorAvatarUrl, chainId: txn.chainId, chainType: txn.chainType, isLiability: txn.isLiability, adjustedAmount: txn.adjustedAmount };
+
+  let approverName = null;
+  let approverAvatarUrl = null;
+  let rejecterName = null;
+  let rejecterAvatarUrl = null;
+
+  if (txn.updateHistory && Array.isArray(txn.updateHistory)) {
+    const approveAction = [...txn.updateHistory].reverse().find(h => h && h.action === 'approve');
+    if (approveAction) {
+      approverName = approveAction.userName || 'Unknown';
+      if (approveAction.userId) {
+        const u = await prisma.user.findUnique({ where: { id: approveAction.userId }, select: { avatarUrl: true } });
+        approverAvatarUrl = u?.avatarUrl || null;
+      }
+    }
+    const rejectAction = [...txn.updateHistory].reverse().find(h => h && h.action === 'reject');
+    if (rejectAction) {
+      rejecterName = rejectAction.userName || 'Unknown';
+      if (rejectAction.userId) {
+        const u = await prisma.user.findUnique({ where: { id: rejectAction.userId }, select: { avatarUrl: true } });
+        rejecterAvatarUrl = u?.avatarUrl || null;
+      }
+    }
+  }
+
+  return {
+    ...txn,
+    recipientName,
+    fundName,
+    creatorName,
+    creatorAvatarUrl,
+    approverName,
+    approverAvatarUrl,
+    rejecterName,
+    rejecterAvatarUrl,
+    chainId: txn.chainId,
+    chainType: txn.chainType,
+    isLiability: txn.isLiability,
+    adjustedAmount: txn.adjustedAmount
+  };
 }
 
 // --- AUTH ROUTES ---
@@ -369,7 +422,7 @@ app.use('/api/auth/register', authLimiter);
 app.post('/api/auth/register', async (req, res) => {
   try {
     const { name, identifier, password, phone } = req.body;
-    
+
     if (!identifier || !password || !name) {
       return res.status(400).json({ error: 'Name, identifier (email/phone), and password are required' });
     }
@@ -414,6 +467,7 @@ app.post('/api/auth/register', async (req, res) => {
         name: `${name}'s Personal`,
         isPersonal: true,
         inviteCode: null,
+        categories: DEFAULT_CATEGORIES,
       }
     });
 
@@ -494,7 +548,12 @@ app.post('/api/auth/login', async (req, res) => {
     });
     if (!existingPersonalOrg) {
       const personalOrg = await prisma.organization.create({
-        data: { name: `${user.name}'s Personal`, isPersonal: true, inviteCode: null }
+        data: {
+          name: `${user.name}'s Personal`,
+          isPersonal: true,
+          inviteCode: null,
+          categories: DEFAULT_CATEGORIES,
+        }
       });
       await prisma.organizationMember.create({
         data: { userId: user.id, organizationId: personalOrg.id, role: 'admin', status: 'active' }
@@ -647,7 +706,11 @@ app.get('/api/users/search', authenticateToken, async (req, res) => {
 app.get('/api/org/members', authenticateToken, async (req, res) => {
   try {
     const memberships = await prisma.organizationMember.findMany({
-      where: { userId: req.user.id, status: 'active' },
+      where: {
+        userId: req.user.id,
+        status: 'active',
+        organization: { isPersonal: false }
+      },
       select: { organizationId: true },
     });
 
@@ -742,9 +805,9 @@ app.get('/api/books', authenticateToken, async (req, res) => {
 
     const booksWithRole = books.map(book => {
       const membership = activeMemberships.find(m => m.organizationId === book.organizationId);
-      return { 
-        ...book, 
-        role: membership?.role || 'member', 
+      return {
+        ...book,
+        role: membership?.role || 'member',
         permissions: membership?.permissions || [],
         status: 'active'
       };
@@ -970,7 +1033,7 @@ app.post('/api/transactions', authenticateToken, async (req, res) => {
             amount: parsedAmount,
             type: 'income',
             note: 'Org fund transfer: ' + (note || ''),
-            category: 'Org Fund Advance',
+            category: 'Send',
             contact,
             recipientOrgId: book.organizationId,
             createdById: req.user.id,
@@ -1054,7 +1117,7 @@ app.post('/api/transactions', authenticateToken, async (req, res) => {
           data: { bookId, amount: parsedAmount, type: 'expense', note: sourceNote, category: 'Send', contact, recipientUserId, createdById: req.user.id, reconStatus: initialStatus, imageUrl, chainId, chainType, orgFundId, clientRef: txnClientRef }
         });
         const recipientTxn = await prisma.transaction.create({
-          data: { bookId: recipientBook.id, amount: parsedAmount, type: 'income', note: 'Org fund advance: ' + (note || ''), category: 'Org Fund Advance', contact, recipientUserId: req.user.id, linkedTransactionId: null, createdById: req.user.id, reconStatus: initialStatus, chainId, chainType }
+          data: { bookId: recipientBook.id, amount: parsedAmount, type: 'income', note: 'Org fund advance: ' + (note || ''), category: 'Send', contact, recipientUserId: req.user.id, linkedTransactionId: null, createdById: req.user.id, reconStatus: initialStatus, chainId, chainType }
         });
         await prisma.book.update({ where: { id: bookId }, data: { balance: { decrement: parsedAmount } } });
         await prisma.book.update({ where: { id: recipientBook.id }, data: { balance: { increment: parsedAmount } } });
@@ -1930,6 +1993,22 @@ app.post('/api/transactions/:id/action', authenticateToken, async (req, res) => 
     const txnBook = await prisma.book.findUnique({ where: { id: txn.bookId } });
     if (!txnBook) return res.status(404).json({ error: 'Book not found' });
 
+    // Fetch details of user taking action to save in updateHistory
+    const user = await prisma.user.findUnique({ where: { id: req.user.id }, select: { name: true } });
+    const userName = user?.name || 'Unknown';
+    const approveHistoryEntry = {
+      timestamp: new Date().toISOString(),
+      userId: req.user.id,
+      userName,
+      action: 'approve'
+    };
+    const rejectHistoryEntry = {
+      timestamp: new Date().toISOString(),
+      userId: req.user.id,
+      userName,
+      action: 'reject'
+    };
+
     // Verify caller is admin/editor of the transaction's org
     // OR that the caller is the recipient of this or the linked transaction (user or org admin/editor)
     let isRecipient = false;
@@ -2036,11 +2115,23 @@ app.post('/api/transactions/:id/action', authenticateToken, async (req, res) => 
       await prisma.$transaction([
         prisma.transaction.update({
           where: { id: sourceTxn.id },
-          data: { amount: finalAmount, reconStatus: 'approved', counterProposedAmount: null, counterProposedBy: null }
+          data: {
+            amount: finalAmount,
+            reconStatus: 'approved',
+            counterProposedAmount: null,
+            counterProposedBy: null,
+            updateHistory: [...(sourceTxn.updateHistory || []), approveHistoryEntry]
+          }
         }),
         prisma.transaction.update({
           where: { id: recipientTxn.id },
-          data: { amount: finalAmount, reconStatus: 'approved', counterProposedAmount: null, counterProposedBy: null }
+          data: {
+            amount: finalAmount,
+            reconStatus: 'approved',
+            counterProposedAmount: null,
+            counterProposedBy: null,
+            updateHistory: [...(recipientTxn.updateHistory || []), approveHistoryEntry]
+          }
         }),
         prisma.book.update({
           where: { id: sourceTxn.bookId },
@@ -2060,20 +2151,32 @@ app.post('/api/transactions/:id/action', authenticateToken, async (req, res) => 
       if (txn.pendingAction) {
         if (txn.pendingAction === 'edit') {
           await prisma.$transaction(async (tx) => {
-            const current = await tx.transaction.findUnique({ where: { id: txnId }, select: { version: true } });
+            const current = await tx.transaction.findUnique({ where: { id: txnId }, select: { version: true, updateHistory: true } });
             if (!current) throw new Error('Transaction not found');
             const upd1 = await tx.transaction.updateMany({
               where: { id: txnId, version: current.version },
-              data: { reconStatus: 'approved', pendingAction: null, pendingData: null, version: { increment: 1 } }
+              data: {
+                reconStatus: 'approved',
+                pendingAction: null,
+                pendingData: null,
+                version: { increment: 1 },
+                updateHistory: [...(current.updateHistory || []), approveHistoryEntry]
+              }
             });
             if (upd1.count === 0) throw new Error('Concurrency conflict on edit-approve');
 
             if (txn.linkedTransactionId) {
-              const linkedCurrent = await tx.transaction.findUnique({ where: { id: txn.linkedTransactionId }, select: { version: true } });
+              const linkedCurrent = await tx.transaction.findUnique({ where: { id: txn.linkedTransactionId }, select: { version: true, updateHistory: true } });
               if (linkedCurrent) {
                 const upd2 = await tx.transaction.updateMany({
                   where: { id: txn.linkedTransactionId, version: linkedCurrent.version },
-                  data: { reconStatus: 'approved', pendingAction: null, pendingData: null, version: { increment: 1 } }
+                  data: {
+                    reconStatus: 'approved',
+                    pendingAction: null,
+                    pendingData: null,
+                    version: { increment: 1 },
+                    updateHistory: [...(linkedCurrent.updateHistory || []), approveHistoryEntry]
+                  }
                 });
                 if (upd2.count === 0) throw new Error('Concurrency conflict on linked edit-approve');
               }
@@ -2167,20 +2270,28 @@ app.post('/api/transactions/:id/action', authenticateToken, async (req, res) => 
 
           // Send: advance both linked txns with version lock
           await prisma.$transaction(async (tx) => {
-            const main = await tx.transaction.findUnique({ where: { id: txnId }, select: { version: true } });
+            const main = await tx.transaction.findUnique({ where: { id: txnId }, select: { version: true, updateHistory: true } });
             if (!main) throw new Error('Transaction not found');
             const upd1 = await tx.transaction.updateMany({
               where: { id: txnId, version: main.version },
-              data: { reconStatus: nextStatus, version: { increment: 1 } }
+              data: {
+                reconStatus: nextStatus,
+                version: { increment: 1 },
+                updateHistory: [...(main.updateHistory || []), approveHistoryEntry]
+              }
             });
             if (upd1.count === 0) throw new Error('Concurrency conflict on pending_org advance');
 
             if (txn.linkedTransactionId) {
-              const linked = await tx.transaction.findUnique({ where: { id: txn.linkedTransactionId }, select: { version: true } });
+              const linked = await tx.transaction.findUnique({ where: { id: txn.linkedTransactionId }, select: { version: true, updateHistory: true } });
               if (linked) {
                 const upd2 = await tx.transaction.updateMany({
                   where: { id: txn.linkedTransactionId, version: linked.version },
-                  data: { reconStatus: nextStatus, version: { increment: 1 } }
+                  data: {
+                    reconStatus: nextStatus,
+                    version: { increment: 1 },
+                    updateHistory: [...(linked.updateHistory || []), approveHistoryEntry]
+                  }
                 });
                 if (upd2.count === 0) throw new Error('Concurrency conflict on linked pending_org advance');
               }
@@ -2209,7 +2320,11 @@ app.post('/api/transactions/:id/action', authenticateToken, async (req, res) => 
               await prisma.$transaction([
                 prisma.transaction.update({
                   where: { id: txnId, version: txn.version },
-                  data: { reconStatus: 'approved', version: { increment: 1 } }
+                  data: {
+                    reconStatus: 'approved',
+                    version: { increment: 1 },
+                    updateHistory: [...(txn.updateHistory || []), approveHistoryEntry]
+                  }
                 }),
                 prisma.book.update({ where: { id: targetBook.id }, data: { balance: { decrement: txn.amount } } }),
                 prisma.transaction.create({
@@ -2235,7 +2350,10 @@ app.post('/api/transactions/:id/action', authenticateToken, async (req, res) => 
           }
 
           // General expense/voucher: approve directly with version lock
-          const updated = await updateTxnWithVersion(txnId, txn.version, { reconStatus: 'approved' });
+          const updated = await updateTxnWithVersion(txnId, txn.version, {
+            reconStatus: 'approved',
+            updateHistory: [...(txn.updateHistory || []), approveHistoryEntry]
+          });
           broadcast({ type: "data_changed" });
           return res.json({ transaction: updated, message: 'Transaction approved' });
         }
@@ -2244,20 +2362,32 @@ app.post('/api/transactions/:id/action', authenticateToken, async (req, res) => 
       // --- PENDING_RECIPIENT → approve (green) ---
       if (txn.reconStatus === 'pending_recipient') {
         await prisma.$transaction(async (tx) => {
-          const main = await tx.transaction.findUnique({ where: { id: txnId }, select: { version: true } });
+          const main = await tx.transaction.findUnique({ where: { id: txnId }, select: { version: true, updateHistory: true } });
           if (!main) throw new Error('Transaction not found');
           const upd1 = await tx.transaction.updateMany({
             where: { id: txnId, version: main.version },
-            data: { reconStatus: 'approved', counterProposedAmount: null, counterProposedBy: null, version: { increment: 1 } }
+            data: {
+              reconStatus: 'approved',
+              counterProposedAmount: null,
+              counterProposedBy: null,
+              version: { increment: 1 },
+              updateHistory: [...(main.updateHistory || []), approveHistoryEntry]
+            }
           });
           if (upd1.count === 0) throw new Error('Concurrency conflict on pending_recipient approve');
 
           if (txn.linkedTransactionId) {
-            const linked = await tx.transaction.findUnique({ where: { id: txn.linkedTransactionId }, select: { version: true } });
+            const linked = await tx.transaction.findUnique({ where: { id: txn.linkedTransactionId }, select: { version: true, updateHistory: true } });
             if (linked) {
               const upd2 = await tx.transaction.updateMany({
                 where: { id: txn.linkedTransactionId, version: linked.version },
-                data: { reconStatus: 'approved', counterProposedAmount: null, counterProposedBy: null, version: { increment: 1 } }
+                data: {
+                  reconStatus: 'approved',
+                  counterProposedAmount: null,
+                  counterProposedBy: null,
+                  version: { increment: 1 },
+                  updateHistory: [...(linked.updateHistory || []), approveHistoryEntry]
+                }
               });
               if (upd2.count === 0) throw new Error('Concurrency conflict on linked pending_recipient approve');
             }
@@ -2451,11 +2581,20 @@ app.post('/api/transactions/:id/action', authenticateToken, async (req, res) => 
       // ── Atomic reject with linked transaction rollback ──
       await prisma.$transaction(async (tx) => {
         // Version-locked reject of main transaction
-        const mainCurrent = await tx.transaction.findUnique({ where: { id: txnId }, select: { version: true } });
+        const mainCurrent = await tx.transaction.findUnique({ where: { id: txnId }, select: { version: true, updateHistory: true } });
         if (!mainCurrent) throw new Error('Transaction not found');
         const updMain = await tx.transaction.updateMany({
           where: { id: txnId, version: mainCurrent.version },
-          data: { reconStatus: 'rejected', pendingAction: null, pendingData: null, counterProposedAmount: null, counterProposedBy: null, isLiability: isLiabilityReject || undefined, version: { increment: 1 } }
+          data: {
+            reconStatus: 'rejected',
+            pendingAction: null,
+            pendingData: null,
+            counterProposedAmount: null,
+            counterProposedBy: null,
+            isLiability: isLiabilityReject || undefined,
+            version: { increment: 1 },
+            updateHistory: [...(mainCurrent.updateHistory || []), rejectHistoryEntry]
+          }
         });
         if (updMain.count === 0) throw new Error('Concurrency conflict on reject');
 
@@ -2475,14 +2614,31 @@ app.post('/api/transactions/:id/action', authenticateToken, async (req, res) => 
               // Recipient already accepted → mark linked as liability, don't reverse its balance
               const updLink = await tx.transaction.updateMany({
                 where: { id: txn.linkedTransactionId, version: linkedVersion },
-                data: { reconStatus: 'rejected', isLiability: true, pendingAction: null, pendingData: null, counterProposedAmount: null, counterProposedBy: null, version: { increment: 1 } }
+                data: {
+                  reconStatus: 'rejected',
+                  isLiability: true,
+                  pendingAction: null,
+                  pendingData: null,
+                  counterProposedAmount: null,
+                  counterProposedBy: null,
+                  version: { increment: 1 },
+                  updateHistory: [...(linked.updateHistory || []), rejectHistoryEntry]
+                }
               });
               if (updLink.count === 0) throw new Error('Concurrency conflict on linked liability reject');
             } else if (['pending_org', 'pending_recipient', 'pending'].includes(linked.reconStatus)) {
               // Normal rollback: reject linked + reverse its balance atomically
               const updLink = await tx.transaction.updateMany({
                 where: { id: txn.linkedTransactionId, version: linkedVersion },
-                data: { reconStatus: 'rejected', pendingAction: null, pendingData: null, counterProposedAmount: null, counterProposedBy: null, version: { increment: 1 } }
+                data: {
+                  reconStatus: 'rejected',
+                  pendingAction: null,
+                  pendingData: null,
+                  counterProposedAmount: null,
+                  counterProposedBy: null,
+                  version: { increment: 1 },
+                  updateHistory: [...(linked.updateHistory || []), rejectHistoryEntry]
+                }
               });
               if (updLink.count === 0) throw new Error('Concurrency conflict on linked reject');
               const linkedBalanceAdj = linked.type === 'income' ? -linked.amount : linked.amount;
@@ -2661,45 +2817,8 @@ app.get('/api/transactions/:bookId', authenticateToken, async (req, res) => {
       orderBy: { createdAt: 'desc' }
     });
 
-    // Enrich with recipient names and fund info
-    const enriched = await Promise.all(transactions.map(async (txn) => {
-      let recipientName = null;
-      if (txn.recipientUserId) {
-        const user = await prisma.user.findUnique({ where: { id: txn.recipientUserId }, select: { name: true } });
-        recipientName = user?.name || null;
-      }
-      // Identify the source fund name:
-      // 1. If orgFundId exists (personal book Send referencing a fund income)
-      // 2. If linkedTransactionId exists (direct org Send or linked txn)
-      let fundName = null;
-      if (txn.orgFundId) {
-        const fundTxn = await prisma.transaction.findUnique({
-          where: { id: txn.orgFundId },
-        });
-        if (fundTxn?.linkedTransactionId) {
-          const orgTxn = await prisma.transaction.findUnique({
-            where: { id: fundTxn.linkedTransactionId },
-            include: { book: { include: { organization: { select: { name: true } } } } },
-          });
-          fundName = orgTxn?.book?.organization?.name || null;
-        }
-      }
-      if (!fundName && txn.linkedTransactionId) {
-        const linkedTxn = await prisma.transaction.findUnique({
-          where: { id: txn.linkedTransactionId },
-          include: { book: { include: { organization: { select: { name: true } } } } },
-        });
-        fundName = linkedTxn?.book?.organization?.name || null;
-      }
-      let creatorName = null;
-      let creatorAvatarUrl = null;
-      if (txn.createdById) {
-        const u = await prisma.user.findUnique({ where: { id: txn.createdById }, select: { name: true, avatarUrl: true } });
-        creatorName = u?.name || null;
-        creatorAvatarUrl = u?.avatarUrl || null;
-      }
-      return { ...txn, recipientName, fundName, creatorName, creatorAvatarUrl, chainId: txn.chainId, chainType: txn.chainType, isLiability: txn.isLiability, adjustedAmount: txn.adjustedAmount };
-    }));
+    // Enrich with recipient names and fund info using the shared helper
+    const enriched = await Promise.all(transactions.map(txn => enrichTxn(txn)));
 
     res.json(enriched);
   } catch (error) {
@@ -2804,18 +2923,15 @@ app.get('/api/approvals/pending', authenticateToken, async (req, res) => {
     const personalBookIds = user.memberships
       .filter(m => m.status === 'active' && m.organization.isPersonal)
       .flatMap(m => m.organization.books.map(b => b.id));
-      const incomingPendingTxns = await prisma.transaction.findMany({
-        where: {
-          bookId: { in: personalBookIds },
-          reconStatus: { in: ['pending_recipient', 'pending'] },
-          type: 'income',
-          OR: [
-            { category: 'Org Fund Advance' },
-            { category: 'Send' }
-          ]
-        },
-        orderBy: { createdAt: 'desc' }
-      });
+    const incomingPendingTxns = await prisma.transaction.findMany({
+      where: {
+        bookId: { in: personalBookIds },
+        reconStatus: { in: ['pending_recipient', 'pending'] },
+        type: 'income',
+        category: 'Send'
+      },
+      orderBy: { createdAt: 'desc' }
+    });
 
     for (const txn of incomingPendingTxns) {
       const book = await prisma.book.findUnique({ where: { id: txn.bookId } });
@@ -2908,6 +3024,7 @@ app.post('/api/org/create', authenticateToken, async (req, res) => {
       data: {
         name,
         inviteCode,
+        categories: DEFAULT_CATEGORIES,
       }
     });
 
@@ -4203,9 +4320,9 @@ app.get('/api/ai/tools/category-summary', authenticateToken, async (req, res) =>
   try {
     const { bookId, startDate, endDate, orgId } = req.query;
     const where = { userId: req.user.id, status: 'active' };
-    
+
     const memberships = await prisma.organizationMember.findMany({ where, include: { organization: { include: { books: true } } } });
-    
+
     let bookIds = [];
     if (bookId) {
       bookIds = [bookId];
@@ -4566,7 +4683,7 @@ const seedUser = async () => {
   try {
     const email = 'rahat@hisabpata.com';
     const existingUser = await prisma.user.findUnique({ where: { email } });
-    
+
     if (!existingUser) {
       console.log('Seeding clean default user: rahat@hisabpata.com / rahat123...');
       const hashedPassword = await bcrypt.hash('rahat123', 10);
@@ -4582,7 +4699,12 @@ const seedUser = async () => {
 
       // Create Personal Org with default book
       const personalOrg = await prisma.organization.create({
-        data: { name: `${user.name}'s Personal`, isPersonal: true, inviteCode: null }
+        data: {
+          name: `${user.name}'s Personal`,
+          isPersonal: true,
+          inviteCode: null,
+          categories: DEFAULT_CATEGORIES,
+        }
       });
       await prisma.organizationMember.create({
         data: { userId: user.id, organizationId: personalOrg.id, role: 'admin', status: 'active' }
@@ -4632,7 +4754,7 @@ wss.on('connection', (ws, req) => {
     }
   });
 
-  ws.on('error', () => {});
+  ws.on('error', () => { });
 });
 
 function broadcast(data) {
@@ -4652,7 +4774,7 @@ function broadcastToUser(userId, data) {
   const clients = userClients.get(userId);
   if (clients) {
     clients.forEach(client => {
-      try { if (client.readyState === 1) client.send(msg); } catch (e) {}
+      try { if (client.readyState === 1) client.send(msg); } catch (e) { }
     });
   }
 }
@@ -4664,7 +4786,7 @@ function broadcastToUsers(userIds, data) {
     const clients = userClients.get(userId);
     if (clients) {
       clients.forEach(client => {
-        try { if (client.readyState === 1) client.send(msg); } catch (e) {}
+        try { if (client.readyState === 1) client.send(msg); } catch (e) { }
       });
     }
   }
