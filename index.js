@@ -13,6 +13,46 @@ const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
 require('dotenv').config();
+const { Readable } = require('stream');
+
+const useSeafile = !!process.env.SEAFILE_URL;
+const seafileUrl = process.env.SEAFILE_URL ? process.env.SEAFILE_URL.replace(/\/$/, '') : '';
+const seafileToken = process.env.SEAFILE_TOKEN;
+const seafileRepo = process.env.SEAFILE_REPO_ID;
+const seafileDir = process.env.SEAFILE_DIR || '/';
+
+async function uploadToSeafile(localPath, filename) {
+  if (!useSeafile) return;
+  try {
+    const linkRes = await fetch(`${seafileUrl}/api2/repos/${seafileRepo}/upload-link/?p=${seafileDir}`, {
+      headers: { 'Authorization': `Token ${seafileToken}` }
+    });
+    if (!linkRes.ok) throw new Error('Failed to get Seafile upload link: ' + await linkRes.text());
+    
+    const uploadLink = (await linkRes.text()).replace(/"/g, '').trim();
+    
+    const formData = new FormData();
+    formData.append('parent_dir', seafileDir);
+    formData.append('filename', filename);
+    const fileBuffer = fs.readFileSync(localPath);
+    const blob = new Blob([fileBuffer]);
+    formData.append('file', blob, filename);
+    
+    const res = await fetch(uploadLink, {
+      method: 'POST',
+      headers: { 'Authorization': `Token ${seafileToken}` },
+      body: formData
+    });
+    
+    if (res.ok) {
+      try { fs.unlinkSync(localPath); } catch (e) {}
+    } else {
+      console.error('Seafile upload error:', await res.text());
+    }
+  } catch (error) {
+    console.error('Failed to upload to Seafile:', error);
+  }
+}
 
 const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 const adapter = new PrismaPg(pool);
@@ -98,6 +138,28 @@ app.use(cors({
   credentials: !isCorsWildcard,
 }));
 app.use(express.json());
+if (useSeafile) {
+  app.get('/uploads/:filename', async (req, res, next) => {
+    try {
+      const dlRes = await fetch(`${seafileUrl}/api2/repos/${seafileRepo}/file/?p=${seafileDir}/${req.params.filename}`, {
+        headers: { 'Authorization': `Token ${seafileToken}` }
+      });
+      if (!dlRes.ok) return next();
+      const dlLink = (await dlRes.text()).replace(/"/g, '').trim();
+      
+      const fileRes = await fetch(dlLink);
+      if (!fileRes.ok) return next();
+      
+      const ct = fileRes.headers.get('content-type');
+      const cl = fileRes.headers.get('content-length');
+      if (ct) res.setHeader('Content-Type', ct);
+      if (cl) res.setHeader('Content-Length', cl);
+      Readable.fromWeb(fileRes.body).pipe(res);
+    } catch (e) {
+      next();
+    }
+  });
+}
 app.use('/uploads', express.static(uploadDir));
 app.use('/admin', express.static(path.join(__dirname, 'admin_console')));
 
@@ -172,6 +234,8 @@ app.post('/api/upload', authenticateToken, (req, res) => {
     if (!req.file) {
       return res.status(400).json({ error: 'No file uploaded' });
     }
+
+    uploadToSeafile(req.file.path, req.file.filename);
 
     // Return relative URL path
     const fileUrl = `/uploads/${req.file.filename}`;
@@ -3894,7 +3958,7 @@ app.post('/api/audio-notes/upload', authenticateToken, upload.single('audio'), a
     const mimeType = req.file.mimetype || 'audio/m4a';
 
     // Transcribe via Gemini
-    const geminiUrl = \`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=\${apiKey}\`;
+    const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`;
     const aiReqBody = {
       contents: [{
         parts: [
