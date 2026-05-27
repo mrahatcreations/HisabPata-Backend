@@ -3985,7 +3985,7 @@ app.post('/api/audio-notes/upload', authenticateToken, upload.single('audio'), a
       console.error('Gemini API Error:', await aiRes.text());
     }
 
-    const audioUrl = \`/uploads/\${req.file.filename}\`;
+    const audioUrl = `/uploads/${req.file.filename}`;
     const note = await prisma.audioNote.create({
       data: {
         userId: user.id,
