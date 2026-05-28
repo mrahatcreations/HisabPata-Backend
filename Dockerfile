@@ -9,8 +9,9 @@ ARG JWT_SECRET
 ARG DATABASE_URL
 ARG NODE_ENV
 
-COPY package*.json ./
-RUN npm ci
+COPY package.json package-lock.json ./
+# lock file predates sharp; npm install syncs from package.json in CI/Docker
+RUN npm install --no-audit --no-fund
 
 COPY prisma ./prisma
 COPY prisma.config.js ./
