@@ -272,6 +272,49 @@ const authenticateAdmin = (req, res, next) => {
   next();
 };
 
+// ─── BanglaSpeechAPI (Faster-Whisper Bengali ASR) ───────────────────────────
+// Deploy BanglaSpeechAPI/server.py (e.g. stotext.shilpigosthi.com). Set in .env:
+//   ASR_BASE_URL=https://stotext.shilpigosthi.com
+//   ASR_API_KEY=<VALID_API_KEYS from BanglaSpeechAPI .env>
+function getAsrConfig() {
+  const base = (process.env.ASR_BASE_URL || 'https://stotext.shilpigosthi.com').replace(/\/$/, '');
+  const key = (process.env.ASR_API_KEY || '').trim();
+  return { base, key, enabled: !!key };
+}
+
+async function transcribeWithBanglaSpeechApi(filePath, originalName, mimeType) {
+  const { base, key, enabled } = getAsrConfig();
+  if (!enabled) return null;
+
+  try {
+    const buffer = fs.readFileSync(filePath);
+    const form = new FormData();
+    const blob = new Blob([buffer], { type: mimeType || 'audio/m4a' });
+    form.append('audio_file', blob, originalName || 'audio.m4a');
+
+    const asrRes = await fetch(`${base}/asr`, {
+      method: 'POST',
+      headers: { 'x-api-key': key },
+      body: form,
+      signal: AbortSignal.timeout(120000),
+    });
+
+    const body = (await asrRes.text()).trim();
+    if (!asrRes.ok) {
+      console.error('[ASR] HTTP', asrRes.status, body.slice(0, 300));
+      return null;
+    }
+    if (!body || body.startsWith('Error:')) {
+      console.error('[ASR] Empty or error body:', body.slice(0, 200));
+      return null;
+    }
+    return body;
+  } catch (err) {
+    console.error('[ASR] Request failed:', err.message || err);
+    return null;
+  }
+}
+
 // Upload Endpoint (requires authentication, max 5MB, key: 'file')
 app.post('/api/upload', authenticateToken, (req, res) => {
   upload.single('file')(req, res, async (err) => {
@@ -425,6 +468,56 @@ const findCreatorPersonalMirror = async (orgTxn, txClient = prisma) => {
   });
 };
 
+// Personal expense (org fund) ↔ mirrored expense on org book — same clientRef, not always linkedTransactionId.
+const findFundVoucherPairedTxn = async (txn, book, txClient = prisma) => {
+  if (!txn?.clientRef) return null;
+  let resolvedBook = book;
+  if (!resolvedBook?.organization) {
+    resolvedBook = await txClient.book.findUnique({
+      where: { id: txn.bookId },
+      include: { organization: true }
+    });
+  }
+  if (!resolvedBook) return null;
+
+  const cpm = await findCreatorPersonalMirror(txn, txClient);
+  if (cpm) return cpm;
+
+  if (resolvedBook.organization?.isPersonal && txn.orgFundId) {
+    return txClient.transaction.findFirst({
+      where: {
+        bookId: txn.orgFundId,
+        clientRef: txn.clientRef,
+        createdById: txn.createdById
+      }
+    });
+  }
+
+  if (!resolvedBook.organization?.isPersonal) {
+    return txClient.transaction.findFirst({
+      where: {
+        orgFundId: txn.bookId,
+        clientRef: txn.clientRef,
+        createdById: txn.createdById,
+        book: { organization: { isPersonal: true } }
+      }
+    });
+  }
+  return null;
+};
+
+const reverseTxnBalanceForRemoval = (txn) => {
+  if (txn.type === 'expense') return txn.amount;
+  if (txn.type === 'income') return -txn.amount;
+  return 0;
+};
+
+const applyTxnBalanceForAddition = (txn) => {
+  if (txn.type === 'expense') return -txn.amount;
+  if (txn.type === 'income') return txn.amount;
+  return 0;
+};
+
 // Org book Send expense ↔ personal book Send income
 const resolveOrgDisbursementOrgTxn = async (txn, book) => {
   let resolvedBook = book;
@@ -448,6 +541,70 @@ const resolveOrgDisbursementOrgTxn = async (txn, book) => {
       return { orgTxn: linked, orgBook: linked.book };
     }
   }
+  return null;
+};
+
+// Linked edit/delete: counterparty on the other book/leg (Send, fund_send, org disbursement, mirrors).
+const txnHasLinkedChangeDeleteApproval = (txn) =>
+  !!(
+    txn.linkedTransactionId ||
+    txn.category === 'Send' ||
+    txn.chainType === 'fund_send' ||
+    txn.recipientUserId ||
+    txn.orgFundId
+  );
+
+const getChangeDeleteCounterpartyUserId = async (txn, book, requesterId) => {
+  const disbursement = await resolveOrgDisbursementOrgTxn(txn, book);
+  if (disbursement) {
+    const { orgTxn } = disbursement;
+    const onOrgExpenseLeg =
+      txn.id === orgTxn.id ||
+      (txn.bookId === orgTxn.bookId && txn.type === 'expense' && txn.category === 'Send');
+    if (onOrgExpenseLeg) return orgTxn.recipientUserId || null;
+    if (txn.type === 'income' && txn.category === 'Send') return orgTxn.createdById || null;
+    if (requesterId === orgTxn.createdById) return orgTxn.recipientUserId || null;
+    if (requesterId === orgTxn.recipientUserId) return orgTxn.createdById || null;
+    return orgTxn.recipientUserId || orgTxn.createdById || null;
+  }
+
+  const pairedFund = await findFundVoucherPairedTxn(txn, book);
+  if (pairedFund) {
+    let resolvedBook = book;
+    if (!resolvedBook?.organization) {
+      resolvedBook = await prisma.book.findUnique({
+        where: { id: txn.bookId },
+        include: { organization: true }
+      });
+    }
+    if (resolvedBook?.organization?.isPersonal && txn.orgFundId) {
+      const fundBook = await prisma.book.findUnique({ where: { id: txn.orgFundId } });
+      if (fundBook?.organizationId) {
+        const adminIds = await getOrgAdminUserIds(fundBook.organizationId);
+        const rep = pickOrgRepresentative(adminIds, requesterId);
+        if (rep) return rep;
+      }
+    } else if (!resolvedBook?.organization?.isPersonal) {
+      if (pairedFund.createdById && pairedFund.createdById !== requesterId) return pairedFund.createdById;
+      if (txn.createdById && txn.createdById !== requesterId) return txn.createdById;
+    }
+  }
+
+  if (txn.linkedTransactionId) {
+    const linked = await prisma.transaction.findUnique({
+      where: { id: txn.linkedTransactionId },
+      select: { id: true, createdById: true, recipientUserId: true },
+    });
+    if (linked) {
+      if (linked.createdById && linked.createdById !== requesterId) return linked.createdById;
+      if (linked.recipientUserId && linked.recipientUserId !== requesterId) return linked.recipientUserId;
+      if (txn.recipientUserId && txn.recipientUserId !== requesterId) return txn.recipientUserId;
+      if (txn.createdById && txn.createdById !== requesterId) return txn.createdById;
+    }
+  }
+
+  if (txn.recipientUserId && txn.recipientUserId !== requesterId) return txn.recipientUserId;
+  if (txn.createdById && txn.createdById !== requesterId) return txn.createdById;
   return null;
 };
 
@@ -745,8 +902,41 @@ const getLinkedPartyUserIds = async (txn, book) => {
 };
 
 const getRequiredApproversForChangeDelete = async (txn, book, requesterId) => {
-  const chain = await resolveChangeDeleteChain(txn, book);
-  return computeRequiredApprovers(chain, requesterId).requiredApprovers;
+  let counterparty = await getChangeDeleteCounterpartyUserId(txn, book, requesterId);
+  if (!counterparty && txn.linkedTransactionId) {
+    const linked = await prisma.transaction.findUnique({
+      where: { id: txn.linkedTransactionId },
+      select: { createdById: true, recipientUserId: true },
+    });
+    if (linked?.createdById && linked.createdById !== requesterId) counterparty = linked.createdById;
+    else if (linked?.recipientUserId && linked.recipientUserId !== requesterId) {
+      counterparty = linked.recipientUserId;
+    }
+  }
+  if (counterparty) return [counterparty];
+  if (!txnHasLinkedChangeDeleteApproval(txn)) {
+    const chain = await resolveChangeDeleteChain(txn, book);
+    return computeRequiredApprovers(chain, requesterId).requiredApprovers;
+  }
+  return [];
+};
+
+const mustUseChangeDeleteApprovalFlow = async (txn, book, requesterId) => {
+  const pairedFund = await findFundVoucherPairedTxn(txn, book);
+  if (
+    txn.type === 'income' &&
+    !txn.linkedTransactionId &&
+    !txn.orgFundId &&
+    !pairedFund &&
+    txn.category !== 'Send' &&
+    !txn.recipientUserId &&
+    txn.chainType !== 'fund_send'
+  ) {
+    return false;
+  }
+  if (txnHasLinkedChangeDeleteApproval(txn) || pairedFund) return true;
+  const required = await getRequiredApproversForChangeDelete(txn, book, requesterId);
+  return required.length > 0;
 };
 
 const isChangeDeleteFullyApproved = (pendingData) => {
@@ -754,7 +944,18 @@ const isChangeDeleteFullyApproved = (pendingData) => {
   const required = pd.requiredApprovers || [];
   const orgAnyOf = pd.orgApprovalAnyOf || [];
   const approvals = pd.approvals || [];
-  if (required.length === 0) return true;
+  const legApprovals = pd.legApprovals || [];
+
+  if (pd.dualLegSameUser) {
+    const otherLegId = pd.pairedTransactionId || pd.linkedTransactionId;
+    const fromId = pd.requestedFromTxnId;
+    if (otherLegId && fromId) {
+      return legApprovals.includes(otherLegId) && !legApprovals.includes(fromId);
+    }
+    return false;
+  }
+
+  if (required.length === 0) return false;
 
   const nonOrgRequired = required.filter((id) => !orgAnyOf.includes(id));
   const orgRequired = required.some((id) => orgAnyOf.includes(id));
@@ -763,30 +964,146 @@ const isChangeDeleteFullyApproved = (pendingData) => {
   return peopleOk && orgOk;
 };
 
-const recordChangeDeleteApproval = (pendingData, approverId) => {
+const recordChangeDeleteApproval = (pendingData, approverId, approvingTxnId) => {
   const pd = parsePendingData(pendingData);
   const approvals = [...(pd.approvals || [])];
   if (!approvals.includes(approverId)) approvals.push(approverId);
-  return { ...pd, approvals };
+  const legApprovals = [...(pd.legApprovals || [])];
+  if (approvingTxnId && !legApprovals.includes(approvingTxnId)) legApprovals.push(approvingTxnId);
+  return { ...pd, approvals, legApprovals };
 };
 
 const buildChangeDeletePendingData = async (txn, book, requesterId, baseData = {}) => {
   const chain = await resolveChangeDeleteChain(txn, book);
-  const { requiredApprovers, orgApprovalAnyOf, chainNote, isOrphan } = computeRequiredApprovers(chain, requesterId);
+  let requiredApprovers = await getRequiredApproversForChangeDelete(txn, book, requesterId);
+  const computed = computeRequiredApprovers(chain, requesterId);
+  const { orgApprovalAnyOf, chainNote, isOrphan } = computed;
+  if (requiredApprovers.length === 0 && computed.requiredApprovers?.length) {
+    requiredApprovers = computed.requiredApprovers;
+  }
   const partyIds = await getLinkedPartyUserIds(txn, book);
   const requester = await prisma.user.findUnique({ where: { id: requesterId }, select: { name: true } });
+  const pairedFund = await findFundVoucherPairedTxn(txn, book);
+  const dualLegSameUser =
+    (requiredApprovers.length === 1 && requiredApprovers[0] === requesterId) ||
+    (!!pairedFund && pairedFund.createdById === requesterId && txn.createdById === requesterId);
   return {
     ...baseData,
     requestedBy: requesterId,
     requesterName: requester?.name || 'Unknown',
+    requestedFromTxnId: txn.id,
+    linkedTransactionId: txn.linkedTransactionId || null,
+    pairedTransactionId: pairedFund?.id || null,
     requiredApprovers,
     orgApprovalAnyOf,
     approvals: [],
+    legApprovals: [],
     partyCount: partyIds.length,
     requiredApprovalCount: requiredApprovers.length,
     chainNote,
-    isOrphan: !!isOrphan,
+    isOrphan: !!isOrphan && !txnHasLinkedChangeDeleteApproval(txn),
+    dualLegSameUser,
   };
+};
+
+const getCounterpartLegsForChangeDelete = async (txn, book, txClient = prisma) => {
+  const legs = [];
+  if (txn.linkedTransactionId) {
+    const linked = await txClient.transaction.findUnique({ where: { id: txn.linkedTransactionId } });
+    if (linked) legs.push(linked);
+  }
+  const paired = await findFundVoucherPairedTxn(txn, book, txClient);
+  if (paired && paired.id !== txn.id && !legs.some((l) => l.id === paired.id)) {
+    legs.push(paired);
+  }
+  return legs;
+};
+
+const syncCounterpartLegsForChangeDelete = async (tx, txn, book, opts) => {
+  const {
+    pendingAction,
+    pendingData,
+    fieldUpdates = {},
+    historyEntry = null,
+    reverseBalanceOnRequest = false
+  } = opts;
+  const legs = await getCounterpartLegsForChangeDelete(txn, book, tx);
+  for (const leg of legs) {
+    const legBook = await tx.book.findUnique({ where: { id: leg.bookId } });
+    if (!legBook) continue;
+
+    if (reverseBalanceOnRequest) {
+      let reversed = legBook.balance;
+      if (leg.type === 'income') reversed -= leg.amount;
+      else if (leg.type === 'expense') reversed += leg.amount;
+      await tx.book.update({ where: { id: leg.bookId }, data: { balance: reversed } });
+    }
+
+    const data = { ...fieldUpdates };
+    if (pendingAction) {
+      data.reconStatus = 'pending';
+      data.pendingAction = pendingAction;
+      data.pendingData = pendingData;
+    }
+    if (historyEntry) {
+      data.updateHistory = [...(leg.updateHistory || []), historyEntry];
+    }
+
+    await tx.transaction.update({ where: { id: leg.id }, data });
+  }
+};
+
+const deleteCounterpartLegsForChangeDelete = async (tx, txn, book) => {
+  const legs = await getCounterpartLegsForChangeDelete(txn, book, tx);
+  for (const leg of legs) {
+    const adj = reverseTxnBalanceForRemoval(leg);
+    if (adj !== 0) {
+      await tx.book.update({
+        where: { id: leg.bookId },
+        data: { balance: { increment: adj } }
+      });
+    }
+    await tx.transaction.delete({ where: { id: leg.id } });
+  }
+};
+
+const finalizeCounterpartLegsOnEditApprove = async (tx, txn, book, approveHistoryEntry) => {
+  const legs = await getCounterpartLegsForChangeDelete(txn, book, tx);
+  const source = await tx.transaction.findUnique({ where: { id: txn.id } });
+  if (!source) return;
+
+  for (const leg of legs) {
+    const cur = await tx.transaction.findUnique({
+      where: { id: leg.id },
+      select: { version: true, updateHistory: true, amount: true, type: true, bookId: true }
+    });
+    if (!cur) continue;
+
+    const oldDelta = applyTxnBalanceForAddition(cur);
+    const syncFields = {
+      amount: source.amount,
+      note: source.note,
+      category: source.category,
+      reconStatus: 'approved',
+      pendingAction: null,
+      pendingData: null,
+      version: { increment: 1 },
+      updateHistory: [...(cur.updateHistory || []), approveHistoryEntry]
+    };
+    await tx.transaction.updateMany({
+      where: { id: leg.id, version: cur.version },
+      data: syncFields
+    });
+
+    const newDelta = source.type === 'expense' ? -source.amount : source.amount;
+    const balanceFix = newDelta - oldDelta;
+    if (balanceFix !== 0) {
+      await tx.book.update({
+        where: { id: leg.bookId },
+        data: { balance: { increment: balanceFix } }
+      });
+    }
+  }
 };
 
 const buildChangeDeleteNotification = (pendingData, pendingAction, txn) => {
@@ -911,7 +1228,8 @@ const createCreatorPersonalMirror = async (tx, {
       imageUrl: orgTxn.imageUrl,
       clientRef: txnClientRef + CREATOR_PERSONAL_MIRROR_SUFFIX,
       chainId: orgTxn.chainId || null,
-      chainType: orgTxn.chainType || null
+      chainType: orgTxn.chainType || null,
+      dateTime: orgTxn.dateTime || new Date()
     }
   });
 
@@ -1149,10 +1467,8 @@ const fundSendRetryStatuses = (bypassOrgApproval, isSelfSend) => {
   if (isSelfSend && bypassOrgApproval) {
     return { personal: 'approved', fundOrg: 'approved', recipient: 'approved' };
   }
-  if (bypassOrgApproval) {
-    return { personal: 'pending_recipient', fundOrg: 'pending_recipient', recipient: 'pending_recipient' };
-  }
-  return { personal: 'pending_org', fundOrg: 'pending_org', recipient: 'pending_recipient' };
+  // Sender legs stay pending until the recipient accepts (no org-ledger approve step).
+  return { personal: 'pending_recipient', fundOrg: 'pending_recipient', recipient: 'pending_recipient' };
 };
 
 // Optimistic-locking update: only succeeds if version matches, then increments it.
@@ -1206,6 +1522,15 @@ async function updateLinkedPairAtomic(txn1Id, txn2Id, data, prismaClient) {
     txn2Id ? client.transaction.findUnique({ where: { id: txn2Id } }) : Promise.resolve(null)
   ]);
   return [updated1, updated2];
+}
+
+/** Client ISO dateTime (device timezone) → Date for DB; falls back to now. */
+function parseClientDateTime(value) {
+  if (value === undefined || value === null || value === '') {
+    return new Date();
+  }
+  const d = new Date(value);
+  return Number.isNaN(d.getTime()) ? new Date() : d;
 }
 
 // Shared transaction enrichment helper — resolves recipientName, fundName, creatorName
@@ -1919,6 +2244,7 @@ app.post('/api/transactions', authenticateToken, async (req, res) => {
     }
 
     const txnClientRef = clientRef || 'cr_' + Date.now() + '_' + Math.random().toString(36).substring(2, 10);
+    const txnDateTime = parseClientDateTime(req.body.dateTime);
     const isSend = type === 'expense' && category === 'Send';
     const isOrgSend = isSend && !!recipientOrgId;
     const isVoucher = !!orgFundId;
@@ -1958,9 +2284,8 @@ app.post('/api/transactions', authenticateToken, async (req, res) => {
       const bypassSourceOrgApproval = await checkApprovalBypass(book.organizationId, req.user.id);
       const bypassRecipientOrgApproval = await checkApprovalBypass(recipientOrgId, req.user.id);
 
-      const initialStatus = !bypassSourceOrgApproval
-        ? 'pending_org'
-        : (!bypassRecipientOrgApproval ? 'pending_recipient' : 'approved');
+      const initialStatus =
+        bypassSourceOrgApproval && bypassRecipientOrgApproval ? 'approved' : 'pending_recipient';
 
       const result = await prisma.$transaction(async (prisma) => {
         const sourceTxn = await prisma.transaction.create({
@@ -1975,7 +2300,8 @@ app.post('/api/transactions', authenticateToken, async (req, res) => {
             createdById: req.user.id,
             reconStatus: initialStatus,
             imageUrl,
-            clientRef: txnClientRef
+            clientRef: txnClientRef,
+            dateTime: txnDateTime
           }
         });
         const recipientTxn = await prisma.transaction.create({
@@ -1990,7 +2316,8 @@ app.post('/api/transactions', authenticateToken, async (req, res) => {
             createdById: req.user.id,
             reconStatus: initialStatus,
             imageUrl,
-            clientRef: txnClientRef
+            clientRef: txnClientRef,
+            dateTime: txnDateTime
           }
         });
 
@@ -2077,7 +2404,8 @@ app.post('/api/transactions', authenticateToken, async (req, res) => {
               imageUrl,
               chainId,
               chainType,
-              clientRef: txnClientRef
+              clientRef: txnClientRef,
+              dateTime: txnDateTime
             }
           });
 
@@ -2098,7 +2426,8 @@ app.post('/api/transactions', authenticateToken, async (req, res) => {
               chainId,
               chainType,
               clientRef: txnClientRef,
-              linkedTransactionId: personalTxn.id
+              linkedTransactionId: personalTxn.id,
+              dateTime: txnDateTime
             }
           });
 
@@ -2120,7 +2449,8 @@ app.post('/api/transactions', authenticateToken, async (req, res) => {
               imageUrl,
               chainId,
               chainType,
-              clientRef: txnClientRef
+              clientRef: txnClientRef,
+              dateTime: txnDateTime
             }
           });
 
@@ -2184,7 +2514,7 @@ app.post('/api/transactions', authenticateToken, async (req, res) => {
       // Determine initial state based on org approval policy
       let bypassOrgApproval = await checkApprovalBypass(book.organizationId, req.user.id);
       const isSelfSend = recipientUserId === req.user.id;
-      const initialStatus = (isSelfSend && bypassOrgApproval) ? 'approved' : (bypassOrgApproval ? 'pending_recipient' : 'pending_org');
+      const initialStatus = (isSelfSend && bypassOrgApproval) ? 'approved' : 'pending_recipient';
 
       // ── Chain / Split / Deficit logic when fund source is selected ──
       let chainId = null;
@@ -2219,10 +2549,10 @@ app.post('/api/transactions', authenticateToken, async (req, res) => {
 
       const result = await prisma.$transaction(async (prisma) => {
         const sourceTxn = await prisma.transaction.create({
-          data: { bookId, amount: parsedAmount, type: 'expense', note: sourceNote, category: 'Send', contact, recipientUserId, createdById: req.user.id, reconStatus: initialStatus, imageUrl, chainId, chainType, orgFundId, clientRef: txnClientRef }
+          data: { bookId, amount: parsedAmount, type: 'expense', note: sourceNote, category: 'Send', contact, recipientUserId, createdById: req.user.id, reconStatus: initialStatus, imageUrl, chainId, chainType, orgFundId, clientRef: txnClientRef, dateTime: txnDateTime }
         });
         const recipientTxn = await prisma.transaction.create({
-          data: { bookId: recipientBook.id, amount: parsedAmount, type: 'income', note: note || '', category: 'Send', contact, recipientUserId: req.user.id, linkedTransactionId: null, createdById: req.user.id, reconStatus: initialStatus, chainId, chainType }
+          data: { bookId: recipientBook.id, amount: parsedAmount, type: 'income', note: note || '', category: 'Send', contact, recipientUserId: req.user.id, linkedTransactionId: null, createdById: req.user.id, reconStatus: initialStatus, chainId, chainType, dateTime: txnDateTime }
         });
         await prisma.book.update({ where: { id: bookId }, data: { balance: { decrement: parsedAmount } } });
         await prisma.book.update({ where: { id: recipientBook.id }, data: { balance: { increment: parsedAmount } } });
@@ -2294,7 +2624,7 @@ app.post('/api/transactions', authenticateToken, async (req, res) => {
         const voucherStatus = 'pending_org';
 
         const [txn, updatedBook] = await prisma.$transaction([
-          prisma.transaction.create({ data: { bookId, amount: parsedAmount, type: 'expense', note, category, contact, orgFundId, createdById: req.user.id, reconStatus: voucherStatus, imageUrl, clientRef: txnClientRef } }),
+          prisma.transaction.create({ data: { bookId, amount: parsedAmount, type: 'expense', note, category, contact, orgFundId, createdById: req.user.id, reconStatus: voucherStatus, imageUrl, clientRef: txnClientRef, dateTime: txnDateTime } }),
           prisma.book.update({ where: { id: bookId }, data: { balance: { decrement: parsedAmount } } })
         ]);
 
@@ -2320,7 +2650,8 @@ app.post('/api/transactions', authenticateToken, async (req, res) => {
               createdById: req.user.id,
               reconStatus: voucherStatus,
               imageUrl,
-              clientRef: txnClientRef
+              clientRef: txnClientRef,
+              dateTime: txnDateTime
             }
           }),
           prisma.book.update({ where: { id: bookId }, data: { balance: { decrement: parsedAmount } } })
@@ -2346,7 +2677,7 @@ app.post('/api/transactions', authenticateToken, async (req, res) => {
 
     const createResult = await prisma.$transaction(async (tx) => {
       const transaction = await tx.transaction.create({
-        data: { bookId, amount: parsedAmount, type, note, category, contact, createdById: req.user.id, reconStatus: initialStatus, imageUrl, clientRef: txnClientRef }
+        data: { bookId, amount: parsedAmount, type, note, category, contact, createdById: req.user.id, reconStatus: initialStatus, imageUrl, clientRef: txnClientRef, dateTime: txnDateTime }
       });
       await tx.book.update({ where: { id: bookId }, data: { balance: balanceOp } });
       await maybeMirrorOrgTxnToCreatorPersonal(tx, {
@@ -2379,7 +2710,7 @@ app.post('/api/transactions', authenticateToken, async (req, res) => {
 // --- EDIT TRANSACTION ---
 app.put('/api/transactions/:id', authenticateToken, async (req, res) => {
   try {
-    const { amount, type, note, category, contact, recipientUserId, imageUrl, orgFundId } = req.body;
+    const { amount, type, note, category, contact, recipientUserId, imageUrl, orgFundId, dateTime: clientDateTime } = req.body;
     const txnId = req.params.id;
 
     const txn = await prisma.transaction.findUnique({ where: { id: txnId } });
@@ -2394,9 +2725,24 @@ app.put('/api/transactions/:id', authenticateToken, async (req, res) => {
 
     const finalType = type !== undefined ? type : txn.type;
     const finalCategory = category !== undefined ? category : txn.category;
-    if (!book.organization.isPersonal && finalType === 'expense' && finalCategory !== 'Send') {
+    const isExistingOrgFundMirror =
+      !book.organization.isPersonal &&
+      txn.type === 'expense' &&
+      txn.category &&
+      txn.category !== 'Send';
+    if (
+      !book.organization.isPersonal &&
+      finalType === 'expense' &&
+      finalCategory !== 'Send' &&
+      !isExistingOrgFundMirror
+    ) {
       return res.status(400).json({
         error: 'Organization books only support Send for expenses. Use your personal book with this organization as fund for other categories.'
+      });
+    }
+    if (isExistingOrgFundMirror && category !== undefined && category === 'Send') {
+      return res.status(400).json({
+        error: 'Fund voucher entries cannot be changed to Send. Edit amount or note only.'
       });
     }
 
@@ -2421,6 +2767,9 @@ app.put('/api/transactions/:id', authenticateToken, async (req, res) => {
         changes.orgFundId = orgFundId;
       }
     }
+    if (clientDateTime !== undefined && clientDateTime !== null && clientDateTime !== '') {
+      changes.dateTime = parseClientDateTime(clientDateTime);
+    }
 
     if (Object.keys(changes).length === 0) return res.status(400).json({ error: 'No fields to update' });
 
@@ -2440,11 +2789,13 @@ app.put('/api/transactions/:id', authenticateToken, async (req, res) => {
     }
 
     const user = await prisma.user.findUnique({ where: { id: req.user.id }, select: { name: true } });
+    const mustApprove = await mustUseChangeDeleteApprovalFlow(txn, book, req.user.id);
     const requiredApprovers = await getRequiredApproversForChangeDelete(txn, book, req.user.id);
-    const needsLinkedApproval = requiredApprovers.length > 0;
-    const isManualIncome = txn.type === 'income' && !txn.linkedTransactionId;
+    if (mustApprove && requiredApprovers.length === 0) {
+      return res.status(400).json({ error: 'Could not resolve counterparty for edit/delete approval' });
+    }
 
-    if (!needsLinkedApproval || isManualIncome) {
+    if (!mustApprove) {
       // Direct edit logic
       let balanceAdjustment = 0;
       if (
@@ -2478,36 +2829,22 @@ app.put('/api/transactions/:id', authenticateToken, async (req, res) => {
           await prisma.book.update({ where: { id: book.id }, data: { balance: { increment: balanceAdjustment } } });
         }
 
-        if (txn.linkedTransactionId) {
-          const linkedTxn = await prisma.transaction.findUnique({ where: { id: txn.linkedTransactionId } });
-          if (linkedTxn) {
-            const linkedChanges = {};
-            if (changes.amount !== undefined) linkedChanges.amount = parsedAmount;
-            if (changes.note !== undefined) linkedChanges.note = changes.note;
-            if (Object.keys(linkedChanges).length > 0) {
-              let linkedBalAdj = 0;
-              if (linkedTxn.reconStatus !== 'rejected' && changes.amount !== undefined && changes.amount !== linkedTxn.amount) {
-                if (linkedTxn.type === 'income') linkedBalAdj = parsedAmount - linkedTxn.amount;
-                else if (linkedTxn.type === 'expense') linkedBalAdj = linkedTxn.amount - parsedAmount;
-              }
-              await prisma.transaction.update({
-                where: { id: txn.linkedTransactionId },
-                data: {
-                  ...linkedChanges,
-                  updateHistory: [
-                    ...(linkedTxn.updateHistory || []),
-                    { timestamp: new Date().toISOString(), userId: req.user.id, userName: user?.name || 'Unknown', action: 'edit (linked)', changes: { old: { amount: linkedTxn.amount, note: linkedTxn.note }, new: linkedChanges } },
-                  ],
-                },
-              });
-              if (linkedBalAdj !== 0) {
-                await prisma.book.update({ where: { id: linkedTxn.bookId }, data: { balance: { increment: linkedBalAdj } } });
-              }
+        const linkedChanges = {};
+        if (changes.amount !== undefined) linkedChanges.amount = parsedAmount;
+        if (changes.note !== undefined) linkedChanges.note = changes.note;
+        if (changes.category !== undefined) linkedChanges.category = changes.category;
+        if (Object.keys(linkedChanges).length > 0) {
+          await syncCounterpartLegsForChangeDelete(prisma, txn, book, {
+            fieldUpdates: linkedChanges,
+            historyEntry: {
+              timestamp: new Date().toISOString(),
+              userId: req.user.id,
+              userName: user?.name || 'Unknown',
+              action: 'edit (counterpart)',
+              changes: { new: linkedChanges }
             }
-          }
+          });
         }
-
-
 
         return updatedTxn;
       });
@@ -2563,44 +2900,24 @@ app.put('/api/transactions/:id', authenticateToken, async (req, res) => {
           data: { balance: preTxnBalance },
         });
 
-        if (txn.linkedTransactionId) {
-          const linkedTxn = await prisma.transaction.findUnique({ where: { id: txn.linkedTransactionId } });
-          if (linkedTxn) {
-            const linkedBalanceOp = linkedTxn.type === 'income'
-              ? { decrement: linkedTxn.amount }
-              : { increment: linkedTxn.amount };
-            await prisma.book.update({
-              where: { id: linkedTxn.bookId },
-              data: { balance: linkedBalanceOp },
-            });
+        const linkedChanges = {};
+        if (changes.amount !== undefined) linkedChanges.amount = parsedAmount;
+        if (changes.note !== undefined) linkedChanges.note = changes.note;
+        if (changes.category !== undefined) linkedChanges.category = changes.category;
 
-            const linkedChanges = {};
-            if (changes.amount !== undefined) linkedChanges.amount = parsedAmount;
-            if (changes.note !== undefined) linkedChanges.note = changes.note;
-
-            await prisma.transaction.update({
-              where: { id: txn.linkedTransactionId },
-              data: {
-                ...linkedChanges,
-                reconStatus: 'pending',
-                pendingAction: 'edit',
-                pendingData,
-                updateHistory: [
-                  ...(linkedTxn.updateHistory || []),
-                  {
-                    timestamp: new Date().toISOString(),
-                    userId: req.user.id,
-                    userName: user?.name || 'Unknown',
-                    action: 'edit_request (linked)',
-                    changes: { old: { amount: linkedTxn.amount, note: linkedTxn.note }, new: linkedChanges },
-                  },
-                ],
-              },
-            });
-          }
-        }
-
-
+        await syncCounterpartLegsForChangeDelete(prisma, txn, book, {
+          pendingAction: 'edit',
+          pendingData,
+          fieldUpdates: linkedChanges,
+          historyEntry: {
+            timestamp: new Date().toISOString(),
+            userId: req.user.id,
+            userName: user?.name || 'Unknown',
+            action: 'edit_request (counterpart)',
+            changes: { new: linkedChanges }
+          },
+          reverseBalanceOnRequest: true
+        });
 
         return updatedTxn;
       });
@@ -2611,6 +2928,7 @@ app.put('/api/transactions/:id', authenticateToken, async (req, res) => {
       const summary = buildChangeDeleteNotification(pendingData, 'edit', updated);
       return res.json({
         transaction: enriched,
+        pending: true,
         message: 'Edit submitted for approval',
         notification: summary,
       });
@@ -2794,10 +3112,11 @@ app.get('/api/transactions/:id/delete-info', authenticateToken, async (req, res)
     }
 
     if (txn.reconStatus === 'approved') {
+      const mustApprove = await mustUseChangeDeleteApprovalFlow(txn, book, req.user.id);
       const requiredApprovers = await getRequiredApproversForChangeDelete(txn, book, req.user.id);
-      result.requiredApproverCount = requiredApprovers.length;
-      result.needsApproval = requiredApprovers.length > 0;
-      result.canInstantDelete = requiredApprovers.length === 0;
+      result.requiredApproverCount = mustApprove ? Math.max(1, requiredApprovers.length) : 0;
+      result.needsApproval = mustApprove;
+      result.canInstantDelete = !mustApprove;
     }
 
     return res.json(result);
@@ -2828,42 +3147,27 @@ app.delete('/api/transactions/:id', authenticateToken, async (req, res) => {
     if (txn.pendingAction === 'delete') {
       return res.status(400).json({ error: 'Deletion is already pending approval' });
     }
-    const isManualIncome = txn.type === 'income' && !txn.linkedTransactionId;
+    const mustApprove = await mustUseChangeDeleteApprovalFlow(txn, book, req.user.id);
     const requiredApprovers = await getRequiredApproversForChangeDelete(txn, book, req.user.id);
+    if (mustApprove && requiredApprovers.length === 0) {
+      return res.status(400).json({ error: 'Could not resolve counterparty for edit/delete approval' });
+    }
 
     const executeHardDelete = async () => {
       await prisma.$transaction(async (prisma) => {
-        let balanceAdjustment = 0;
-        if (txn.type === 'expense') balanceAdjustment = txn.amount;
-        else if (txn.type === 'income') balanceAdjustment = -txn.amount;
+        let balanceAdjustment = reverseTxnBalanceForRemoval(txn);
         if (balanceAdjustment !== 0) {
           await prisma.book.update({ where: { id: book.id }, data: { balance: { increment: balanceAdjustment } } });
         }
-        if (txn.linkedTransactionId) {
-          const linked = await prisma.transaction.findUnique({ where: { id: txn.linkedTransactionId } });
-          if (linked) {
-            const linkedBook = await prisma.book.findUnique({ where: { id: linked.bookId } });
-            if (linkedBook) {
-              let linkedAdj = 0;
-              if (linked.type === 'income') linkedAdj = -linked.amount;
-              else if (linked.type === 'expense') linkedAdj = linked.amount;
-              if (linkedAdj !== 0) {
-                await prisma.book.update({ where: { id: linked.bookId }, data: { balance: { increment: linkedAdj } } });
-              }
-            }
-            await prisma.transaction.delete({ where: { id: linked.id } });
-          }
-        }
-
+        await deleteCounterpartLegsForChangeDelete(prisma, txn, book);
         await prisma.transaction.delete({ where: { id: txnId } });
       });
       broadcast({ type: 'data_changed' });
     };
 
-    // Manual personal income or no linked parties — delete immediately
-    if (isManualIncome || requiredApprovers.length === 0) {
+    if (!mustApprove) {
       await executeHardDelete();
-      return res.json({ message: 'Transaction deleted' });
+      return res.json({ message: 'Transaction deleted', pending: false });
     }
 
     // Linked transaction/requires approval: transition to pending delete
@@ -2909,53 +3213,31 @@ app.delete('/api/transactions/:id', authenticateToken, async (req, res) => {
         data: { balance: reversedBalance },
       });
 
-      // Also set linked transaction to pending
-      if (txn.linkedTransactionId) {
-        const linkedTxn = await prisma.transaction.findUnique({ where: { id: txn.linkedTransactionId } });
-        if (linkedTxn) {
-          const linkedBook = await prisma.book.findUnique({ where: { id: linkedTxn.bookId } });
-          if (linkedBook) {
-            let linkedReversed = linkedBook.balance;
-            if (linkedTxn.type === 'income') {
-              linkedReversed -= linkedTxn.amount;
-            } else if (linkedTxn.type === 'expense') {
-              linkedReversed += linkedTxn.amount;
-            }
-            await prisma.book.update({
-              where: { id: linkedTxn.bookId },
-              data: { balance: linkedReversed },
-            });
-          }
-
-          await prisma.transaction.update({
-            where: { id: txn.linkedTransactionId },
-            data: {
-              reconStatus: 'pending',
-              pendingAction: 'delete',
-              pendingData,
-              updateHistory: [
-                ...(linkedTxn.updateHistory || []),
-                {
-                  timestamp: new Date().toISOString(),
-                  userId: req.user.id,
-                  userName: user?.name || 'Unknown',
-                  action: 'delete_request (linked)',
-                  changes: { old: { amount: linkedTxn.amount, type: linkedTxn.type, category: linkedTxn.category, note: linkedTxn.note } },
-                },
-              ],
-            },
-          });
-        }
-      }
-
-
+      await syncCounterpartLegsForChangeDelete(prisma, txn, book, {
+        pendingAction: 'delete',
+        pendingData,
+        historyEntry: {
+          timestamp: new Date().toISOString(),
+          userId: req.user.id,
+          userName: user?.name || 'Unknown',
+          action: 'delete_request (counterpart)',
+          changes: { old: { amount: txn.amount, type: txn.type, category: txn.category, note: txn.note } }
+        },
+        reverseBalanceOnRequest: true
+      });
     });
 
     broadcast({ type: 'data_changed' });
     const refreshedTxn = await prisma.transaction.findUnique({ where: { id: txnId } });
     await notifyChangeDeleteApprovers(refreshedTxn || txn, 'delete', pendingData);
     const summary = buildChangeDeleteNotification(pendingData, 'delete', refreshedTxn || txn);
-    return res.json({ message: 'Delete request submitted for approval', notification: summary });
+    const enriched = refreshedTxn ? await enrichTxn(refreshedTxn) : null;
+    return res.json({
+      message: 'Delete request submitted for approval',
+      pending: true,
+      notification: summary,
+      transaction: enriched
+    });
   } catch (error) {
     console.error('Delete transaction error:', error);
     res.status(500).json({ error: 'Server error deleting transaction' });
@@ -3038,11 +3320,11 @@ app.post('/api/transactions/:id/action', authenticateToken, async (req, res) => 
     if (txn.pendingAction && ['edit', 'delete'].includes(txn.pendingAction)) {
       const pendingDataObj = parsePendingData(txn.pendingData);
       if (pendingDataObj.requestedBy === req.user.id) {
-        const allowLinkedCounterpartySelfApprove =
-          txn.linkedTransactionId &&
-          (pendingDataObj.requiredApprovers || []).includes(req.user.id);
-        if (!allowLinkedCounterpartySelfApprove) {
-          return res.status(403).json({ error: 'You cannot approve or reject your own edit/delete request.' });
+        const dualLeg = pendingDataObj.dualLegSameUser === true;
+        if (!dualLeg || txn.id === pendingDataObj.requestedFromTxnId) {
+          return res.status(403).json({
+            error: 'Approve or reject from the linked book entry (the other leg), not the row you requested from.'
+          });
         }
       }
       const required = pendingDataObj.requiredApprovers || [];
@@ -3051,6 +3333,37 @@ app.post('/api/transactions/:id/action', authenticateToken, async (req, res) => 
         const canApprove = required.includes(req.user.id) || orgAnyOf.includes(req.user.id);
         if (!canApprove) {
           return res.status(403).json({ error: 'You are not authorized to approve this edit/delete request.' });
+        }
+      }
+    }
+
+    // Send on org/personal sender book: org admin must not approve — only the recipient accepts.
+    if (action === 'approve' && txn.category === 'Send' && txn.reconStatus === 'pending_org' && txn.type === 'expense') {
+      const srcBook = await prisma.book.findUnique({
+        where: { id: txn.bookId },
+        include: { organization: { select: { isPersonal: true } } }
+      });
+      if (srcBook) {
+        let recipientUserId = txn.recipientUserId;
+        let recipientOrgId = txn.recipientOrgId;
+        if (!recipientUserId && !recipientOrgId && txn.linkedTransactionId) {
+          const linked = await prisma.transaction.findUnique({
+            where: { id: txn.linkedTransactionId },
+            select: { recipientUserId: true, recipientOrgId: true }
+          });
+          recipientUserId = linked?.recipientUserId;
+          recipientOrgId = linked?.recipientOrgId;
+        }
+        let isAuthorizedRecipient = false;
+        if (recipientUserId) {
+          isAuthorizedRecipient = req.user.id === recipientUserId;
+        } else if (recipientOrgId) {
+          isAuthorizedRecipient = await checkPermission(recipientOrgId, req.user.id, 'edit_all');
+        }
+        if (!isAuthorizedRecipient) {
+          return res.status(403).json({
+            error: 'This send is waiting for the recipient to accept. Approve from the recipient\'s book.',
+          });
         }
       }
     }
@@ -3165,7 +3478,7 @@ app.post('/api/transactions/:id/action', authenticateToken, async (req, res) => 
       // Handle pendingAction transactions (edit/delete requests)
       if (txn.pendingAction) {
         if (txn.pendingAction === 'edit') {
-          const updatedPendingData = recordChangeDeleteApproval(txn.pendingData, req.user.id);
+          const updatedPendingData = recordChangeDeleteApproval(txn.pendingData, req.user.id, txnId);
           if (!isChangeDeleteFullyApproved(updatedPendingData)) {
             await prisma.$transaction(async (tx) => {
               await tx.transaction.update({
@@ -3175,9 +3488,10 @@ app.post('/api/transactions/:id/action', authenticateToken, async (req, res) => 
                   updateHistory: [...(txn.updateHistory || []), approveHistoryEntry]
                 }
               });
-              if (txn.linkedTransactionId) {
+              const legs = await getCounterpartLegsForChangeDelete(txn, txnBook, tx);
+              for (const leg of legs) {
                 await tx.transaction.update({
-                  where: { id: txn.linkedTransactionId },
+                  where: { id: leg.id },
                   data: { pendingData: updatedPendingData }
                 });
               }
@@ -3202,40 +3516,21 @@ app.post('/api/transactions/:id/action', authenticateToken, async (req, res) => 
             });
             if (upd1.count === 0) throw new Error('Concurrency conflict on edit-approve');
 
-            if (txn.linkedTransactionId) {
-              const linkedCurrent = await tx.transaction.findUnique({ where: { id: txn.linkedTransactionId }, select: { version: true, updateHistory: true } });
-              if (linkedCurrent) {
-                const upd2 = await tx.transaction.updateMany({
-                  where: { id: txn.linkedTransactionId, version: linkedCurrent.version },
-                  data: {
-                    reconStatus: 'approved',
-                    pendingAction: null,
-                    pendingData: null,
-                    version: { increment: 1 },
-                    updateHistory: [...(linkedCurrent.updateHistory || []), approveHistoryEntry]
-                  }
-                });
-                if (upd2.count === 0) throw new Error('Concurrency conflict on linked edit-approve');
-              }
-            }
-
-
-
-            // Apply the new amount effect using increment/decrement (GAP 2.3 fix)
             const updated = await tx.transaction.findUnique({ where: { id: txnId } });
             if (updated) {
-              const delta = updated.type === 'expense' ? -updated.amount : updated.amount;
+              const delta = applyTxnBalanceForAddition(updated);
               await tx.book.update({
                 where: { id: txn.bookId },
                 data: { balance: { increment: delta } }
               });
             }
+            await finalizeCounterpartLegsOnEditApprove(tx, txn, txnBook, approveHistoryEntry);
           });
           const updated = await prisma.transaction.findUnique({ where: { id: txnId } });
           broadcast({ type: "data_changed" });
           return res.json({ transaction: updated, message: 'Edit approved' });
         } else if (txn.pendingAction === 'delete') {
-          const updatedPendingData = recordChangeDeleteApproval(txn.pendingData, req.user.id);
+          const updatedPendingData = recordChangeDeleteApproval(txn.pendingData, req.user.id, txnId);
           if (!isChangeDeleteFullyApproved(updatedPendingData)) {
             await prisma.$transaction(async (tx) => {
               await tx.transaction.update({
@@ -3245,9 +3540,10 @@ app.post('/api/transactions/:id/action', authenticateToken, async (req, res) => 
                   updateHistory: [...(txn.updateHistory || []), approveHistoryEntry]
                 }
               });
-              if (txn.linkedTransactionId) {
+              const legs = await getCounterpartLegsForChangeDelete(txn, txnBook, tx);
+              for (const leg of legs) {
                 await tx.transaction.update({
-                  where: { id: txn.linkedTransactionId },
+                  where: { id: leg.id },
                   data: { pendingData: updatedPendingData }
                 });
               }
@@ -3258,15 +3554,14 @@ app.post('/api/transactions/:id/action', authenticateToken, async (req, res) => 
           }
 
           await prisma.$transaction(async (tx) => {
-            if (txn.linkedTransactionId) {
-              const linked = await tx.transaction.findUnique({ where: { id: txn.linkedTransactionId } });
-              if (linked) {
-                await tx.transaction.delete({ where: { id: linked.id } });
-              }
+            const adj = reverseTxnBalanceForRemoval(txn);
+            if (adj !== 0) {
+              await tx.book.update({
+                where: { id: txn.bookId },
+                data: { balance: { increment: adj } }
+              });
             }
-
-
-
+            await deleteCounterpartLegsForChangeDelete(tx, txn, txnBook);
             await tx.transaction.delete({ where: { id: txnId } });
           });
           broadcast({ type: "data_changed" });
@@ -3615,27 +3910,32 @@ app.post('/api/transactions/:id/action', authenticateToken, async (req, res) => 
             });
             if (upd.count === 0) throw new Error('Concurrency conflict on pendingAction reject restore');
 
-            if (txn.linkedTransactionId) {
-              const linkedTxn = await tx.transaction.findUnique({ where: { id: txn.linkedTransactionId } });
-              if (linkedTxn && linkedTxn.pendingAction) {
-                const lpd = linkedTxn.pendingData;
-                if (lpd) {
-                  const linkedDelta = lpd.oldType === 'income' ? lpd.oldAmount : -lpd.oldAmount;
-                  await tx.book.update({
-                    where: { id: linkedTxn.bookId },
-                    data: { balance: { increment: linkedDelta } }
-                  });
-                  const linkVer = linkedTxn.version;
-                  const updL = await tx.transaction.updateMany({
-                    where: { id: txn.linkedTransactionId, version: linkVer },
-                    data: { amount: lpd.oldAmount, type: lpd.oldType, category: lpd.oldCategory, note: lpd.oldNote, reconStatus: 'approved', pendingAction: null, pendingData: null, counterProposedAmount: null, counterProposedBy: null, version: { increment: 1 } }
-                  });
-                  if (updL.count === 0) throw new Error('Concurrency conflict on linked pendingAction reject');
+            const legs = await getCounterpartLegsForChangeDelete(txn, book, tx);
+            for (const leg of legs) {
+              if (!leg.pendingAction) continue;
+              const legPd = parsePendingData(leg.pendingData || pd);
+              const legDelta = legPd.oldType === 'expense' ? -legPd.oldAmount : legPd.oldAmount;
+              await tx.book.update({
+                where: { id: leg.bookId },
+                data: { balance: { increment: legDelta } }
+              });
+              const legVer = await tx.transaction.findUnique({ where: { id: leg.id }, select: { version: true } });
+              if (!legVer) continue;
+              const updL = await tx.transaction.updateMany({
+                where: { id: leg.id, version: legVer.version },
+                data: {
+                  amount: legPd.oldAmount,
+                  type: legPd.oldType,
+                  category: legPd.oldCategory,
+                  note: legPd.oldNote,
+                  reconStatus: 'approved',
+                  pendingAction: null,
+                  pendingData: null,
+                  version: { increment: 1 }
                 }
-              }
+              });
+              if (updL.count === 0) throw new Error('Concurrency conflict on counterpart pendingAction reject');
             }
-
-
           });
         }
         broadcast({ type: "data_changed" });
@@ -3793,7 +4093,7 @@ app.post('/api/transactions/:id/retry', authenticateToken, async (req, res) => {
     const bypassOrgApproval = await checkApprovalBypass(approvalOrgId, req.user.id);
     const isSend = txn.category === 'Send';
     const newStatus = isSend
-      ? (bypassOrgApproval ? 'pending_recipient' : 'pending_org')
+      ? 'pending_recipient'
       : (bypassOrgApproval ? 'approved' : 'pending_org');
 
     const updated = await prisma.$transaction(async (tx) => {
@@ -3999,9 +4299,26 @@ app.get('/api/transactions/:bookId', authenticateToken, async (req, res) => {
       return res.status(403).json({ error: 'Not authorized to view this book' });
     }
 
+    const org = await prisma.organization.findUnique({
+      where: { id: book.organizationId },
+      select: { isPersonal: true }
+    });
+
+    const whereClause = org?.isPersonal
+      ? { bookId }
+      : {
+          OR: [
+            { bookId },
+            {
+              orgFundId: bookId,
+              book: { organization: { isPersonal: true } }
+            }
+          ]
+        };
+
     const transactions = await prisma.transaction.findMany({
-      where: { bookId },
-      orderBy: { createdAt: 'desc' }
+      where: whereClause,
+      orderBy: { dateTime: 'desc' }
     });
 
     // Enrich with recipient names and fund info using the shared helper
@@ -4015,6 +4332,35 @@ app.get('/api/transactions/:bookId', authenticateToken, async (req, res) => {
 });
 
 // Get pending approvals/notifications across all user's orgs
+// BanglaSpeechAPI proxy — Flutter sends audio_file + JWT; API key stays on server.
+app.post('/api/asr/transcribe', authenticateToken, upload.single('audio_file'), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: 'No audio file provided' });
+    const { enabled } = getAsrConfig();
+    if (!enabled) {
+      return res.status(503).json({
+        error: 'ASR not configured',
+        hint: 'Set ASR_BASE_URL and ASR_API_KEY on the backend (BanglaSpeechAPI VALID_API_KEYS).',
+      });
+    }
+
+    const text = await transcribeWithBanglaSpeechApi(
+      req.file.path,
+      req.file.originalname,
+      req.file.mimetype
+    );
+
+    if (!text) {
+      return res.status(502).json({ error: 'Transcription failed' });
+    }
+
+    res.json({ text });
+  } catch (err) {
+    console.error('ASR transcribe error:', err);
+    res.status(500).json({ error: 'Server error during transcription' });
+  }
+});
+
 // --- AUDIO NOTES ENDPOINTS ---
 app.get('/api/audio-notes', authenticateToken, async (req, res) => {
   try {
@@ -4032,46 +4378,57 @@ app.get('/api/audio-notes', authenticateToken, async (req, res) => {
 app.post('/api/audio-notes/upload', authenticateToken, upload.single('audio'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'No audio file provided' });
-    
+
     const user = await prisma.user.findUnique({ where: { id: req.user.id } });
-    if (!user || !user.aiConfig) {
-      return res.status(400).json({ error: 'AI config (API Key) not found for user' });
-    }
-    
-    const aiConfig = typeof user.aiConfig === 'string' ? JSON.parse(user.aiConfig) : user.aiConfig;
-    const apiKey = aiConfig.apiKey;
-    if (!apiKey) return res.status(400).json({ error: 'Gemini API Key is missing in settings' });
+    if (!user) return res.status(400).json({ error: 'User not found' });
 
-    // Read the file as base64
-    const audioData = fs.readFileSync(req.file.path).toString('base64');
-    const mimeType = req.file.mimetype || 'audio/m4a';
+    let transcribedText = await transcribeWithBanglaSpeechApi(
+      req.file.path,
+      req.file.originalname,
+      req.file.mimetype
+    );
 
-    // Transcribe via Gemini
-    const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`;
-    const aiReqBody = {
-      contents: [{
-        parts: [
-          { text: "Listen to this audio and perfectly transcribe exactly what is spoken. If it is in Bengali, write in Bengali text. DO NOT add any extra commentary or formatting, just output the raw text." },
-          { inlineData: { mimeType: mimeType, data: audioData } }
-        ]
-      }],
-      generationConfig: { temperature: 0.2 }
-    };
-
-    const aiRes = await fetch(geminiUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(aiReqBody)
-    });
-
-    let transcribedText = "Unclear audio / Processing failed";
-    if (aiRes.ok) {
-      const aiData = await aiRes.json();
-      if (aiData.candidates && aiData.candidates[0]?.content?.parts) {
-        transcribedText = aiData.candidates[0].content.parts[0].text.trim();
+    // Fallback: Gemini (legacy) when BanglaSpeechAPI is not configured
+    if (!transcribedText) {
+      if (!user.aiConfig) {
+        return res.status(400).json({
+          error: 'ASR not configured on server and no AI config for fallback',
+        });
       }
-    } else {
-      console.error('Gemini API Error:', await aiRes.text());
+      const aiConfig = typeof user.aiConfig === 'string' ? JSON.parse(user.aiConfig) : user.aiConfig;
+      const apiKey = aiConfig.apiKey;
+      if (!apiKey) {
+        return res.status(400).json({ error: 'Set ASR_API_KEY on server or Gemini API Key in settings' });
+      }
+
+      const audioData = fs.readFileSync(req.file.path).toString('base64');
+      const mimeType = req.file.mimetype || 'audio/m4a';
+      const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`;
+      const aiReqBody = {
+        contents: [{
+          parts: [
+            { text: 'Listen to this audio and perfectly transcribe exactly what is spoken. If it is in Bengali, write in Bengali text. DO NOT add any extra commentary or formatting, just output the raw text.' },
+            { inlineData: { mimeType: mimeType, data: audioData } }
+          ]
+        }],
+        generationConfig: { temperature: 0.2 }
+      };
+
+      const aiRes = await fetch(geminiUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(aiReqBody)
+      });
+
+      transcribedText = 'Unclear audio / Processing failed';
+      if (aiRes.ok) {
+        const aiData = await aiRes.json();
+        if (aiData.candidates && aiData.candidates[0]?.content?.parts) {
+          transcribedText = aiData.candidates[0].content.parts[0].text.trim();
+        }
+      } else {
+        console.error('Gemini API Error:', await aiRes.text());
+      }
     }
 
     let audioUrl = `/uploads/${req.file.filename}`;
@@ -4183,6 +4540,13 @@ app.get('/api/approvals/pending', authenticateToken, async (req, res) => {
             include: { book: { include: { organization: { select: { isPersonal: true } } } } }
           });
           if (linkedSource?.type === 'expense' && linkedSource?.category === 'Send' && !linkedSource.book?.organization?.isPersonal) {
+            continue;
+          }
+        }
+
+        // Org/personal Send expense waiting for recipient — not an admin Approval Center item
+        if (!txn.pendingAction && txn.category === 'Send' && txn.type === 'expense') {
+          if (['pending_recipient', 'pending_org', 'pending'].includes(txn.reconStatus)) {
             continue;
           }
         }
@@ -5002,10 +5366,85 @@ const resolveAiTransactionNote = ({ note, description, amount, previewNotes, las
   return (category || 'General').trim();
 };
 
+const normalizeForBookMatch = (s) =>
+  String(s || '').toLowerCase().replace(/[^\w\u0980-\u09ff]/gi, '').trim();
+
+/** Fuzzy match user message to one of their books (e.g. "উইকনোট" → "Weekly Notebook"). */
+const matchBookFromUserMessage = (text, booksWithOrg) => {
+  const q = normalizeForBookMatch(text);
+  if (!q || !booksWithOrg?.length) return null;
+
+  let best = null;
+  let bestScore = 0;
+
+  for (const entry of booksWithOrg) {
+    const name = normalizeForBookMatch(entry.book.name);
+    if (!name || name.length < 2) continue;
+
+    if (q.includes(name) || name.includes(q)) {
+      return entry;
+    }
+
+    const nameWords = String(entry.book.name || '')
+      .toLowerCase()
+      .split(/[\s_\-]+/)
+      .filter((w) => w.length >= 2);
+    for (const word of nameWords) {
+      const nw = normalizeForBookMatch(word);
+      if (nw.length >= 3 && q.includes(nw)) {
+        const score = nw.length + 10;
+        if (score > bestScore) {
+          bestScore = score;
+          best = entry;
+        }
+      }
+    }
+
+    if (/উইক|week|weekly/i.test(q) && /week|উইক|weekly/i.test(name)) {
+      const score = 12;
+      if (score > bestScore) {
+        bestScore = score;
+        best = entry;
+      }
+    }
+    if (/নোট|note|notebook/i.test(q) && /note|নোট|book/i.test(name)) {
+      const score = 6;
+      if (score > bestScore) {
+        bestScore = score;
+        best = entry;
+      }
+    }
+  }
+  return best;
+};
+
+const isAppRelatedAiQuestion = (text, booksWithOrg) => {
+  const msg = text || '';
+  const appRelated =
+    /(hisab|হিসাব|pata|পাতা|balance|ব্যালেন্স|transaction|লেনদেন|book|খাতা|বই|org|সংগঠন|send|expense|income|খরচ|আয়|category|approval|অনুমোদন|টাকা|taka|ledger|account|fund|rickshaw|বাজার|salary|বেতন|personal|member|admin|editor|জমা|deposit|উইক|week|notebook|নোট|খরচ|দেখ|কত|আছে|যোগ|লিখ|রেকর্ড|audio|অডিও|voice|pending|অপেক্ষ)/i;
+  if (appRelated.test(msg)) return true;
+  if (matchBookFromUserMessage(msg, booksWithOrg)) return true;
+  if (/\?/.test(msg) && /(কি|কী|কত|আছে|দেখ|বল|হবে|কেন|কিভাবে|how|what|show|list)/i.test(msg)) {
+    return true;
+  }
+  return false;
+};
+
 const detectAiIntent = (messages) => {
   const lastUser = [...(messages || [])].reverse().find(m => m.role === 'user');
   const q = (lastUser?.content || '').toLowerCase();
-  if (/(balance|ব্যালেন্স|balence|মোট ব্যালেন্স|total balance|কত টাকা আছে|how much money)/i.test(q)) {
+
+  if (
+    /(balance|ব্যালেন্স|balence|মোট ব্যালেন্স|total balance|কত টাকা|how much money|জমা|deposit|স্থিতি|বাকি|টাকা আছে|কত আছে|কি আছে|আছে কি|কত টাকা)/i.test(
+      q
+    )
+  ) {
+    return 'balance';
+  }
+  if (
+    /(খাতায়|বইতে|book|notebook|নোটবুক|উইক|week)/i.test(q) &&
+    /(কত|আছে|জমা|টাকা|balance|খরচ|আয়|income|expense)/i.test(q)
+  ) {
     return 'balance';
   }
   if (/(category|ক্যাটাগরি|খরচের হার|spending breakdown|বিভাগে খরচ|কোন খাতে)/i.test(q)) {
@@ -5019,6 +5458,9 @@ const detectAiIntent = (messages) => {
   }
   if (/\d/.test(q) && /(খরচ|expense|income|আয়|লেনদেন|record|যোগ|add|rickshaw|রিকশা|bazar|বাজার|send|পাঠ)/i.test(q)) {
     return 'transaction';
+  }
+  if (/(কুইক নোট|quick note|voice note|ভয়েস নোট).*(বিশ্লেষণ|পড়|analyze|read|summary|সারাংশ|এন্ট্রি|entry|লেনদেন)/i.test(q)) {
+    return 'general';
   }
   return 'general';
 };
@@ -5097,20 +5539,9 @@ const saveAiChatTurn = async ({ userId, userMessage, assistantMessage, bookId, m
   }
 };
 
-const tryOffTopicAiResponse = (messages, agentCtx) => {
-  const lastUserMessage = getLastUserMessage(messages);
-  const { intent } = agentCtx;
-  if (intent !== 'general') return { handled: false };
-
-  const appRelated = /(hisab|হিসাব|pata|পাতা|balance|ব্যালেন্স|transaction|লেনদেন|book|খাতা|org|সংগঠন|send|expense|income|খরচ|আয়|category|approval|অনুমোদন|টাকা|taka|ledger|account|fund|rickshaw|বাজার|salary|বেতন|personal|member|admin|editor)/i;
-  if (appRelated.test(lastUserMessage || '')) return { handled: false };
-
-  const isBn = isBanglaMessage(lastUserMessage);
-  const text = isBn
-    ? 'আমি শুধু হিসাব পাতা অ্যাপের হিসাব, খাতা ও লেনদেন নিয়ে সাহায্য করি। ব্যালেন্স, খরচ বা লেনদেন যোগ করতে বলুন।'
-    : 'I only help with Hisab Pata books, balances, and transactions. Ask about your balance, spending, or adding a transaction.';
-  return { handled: true, cleanResponse: text, proposedActions: [] };
-};
+// Casual / clarify / off-topic replies go to the LLM (no canned text).
+const tryClarifyAmbiguousAiResponse = () => ({ handled: false });
+const tryOffTopicAiResponse = () => ({ handled: false });
 
 const isBanglaMessage = (text) => /[\u0980-\u09FF]/.test(text || '');
 
@@ -5142,12 +5573,14 @@ const parseTransactionHints = (text, booksWithOrg, defaultBookId) => {
     }
   }
 
-  let matchedEntry = null;
-  for (const entry of booksWithOrg) {
-    const name = entry.book.name.toLowerCase();
-    if (name.length > 2 && q.includes(name)) {
-      matchedEntry = entry;
-      break;
+  let matchedEntry = matchBookFromUserMessage(text, booksWithOrg);
+  if (!matchedEntry) {
+    for (const entry of booksWithOrg) {
+      const name = entry.book.name.toLowerCase();
+      if (name.length > 2 && q.includes(name)) {
+        matchedEntry = entry;
+        break;
+      }
     }
   }
   if (!matchedEntry && /(personal|পার্সোনাল|personal book|নিজের)/i.test(text || '')) {
@@ -5211,57 +5644,10 @@ const buildTransactionAction = (hints, lastUserMessage, bookRecord) => ({
 const tryDeterministicAiResponse = async (messages, agentCtx, userId) => {
   const lastUserMessage = getLastUserMessage(messages);
   const isBn = isBanglaMessage(lastUserMessage);
-  const { intent, serverToolData, contextBookId, booksWithOrg, recentTxns, pendingApprovalCount } = agentCtx;
+  const { intent, transactionHints } = agentCtx;
 
-  if (intent === 'balance' && serverToolData.balanceBlock) {
-    const books = serverToolData.balanceBooks || [];
-    const total = books.reduce((sum, b) => sum + (b.balance || 0), 0);
-    const text = isBn
-      ? `আপনার ${books.length}টি খাতার মোট ব্যালেন্স ৳${Math.round(total)}।`
-      : `Total balance across ${books.length} book(s): ৳${Math.round(total)}.`;
-    return {
-      handled: true,
-      cleanResponse: `${text}\n\n${serverToolData.balanceBlock}`,
-      proposedActions: [],
-    };
-  }
-
-  if (intent === 'category' && serverToolData.categoryBlock) {
-    const text = isBn
-      ? 'আপনার approved খরচের ক্যাটাগরি breakdown নিচে দেখুন।'
-      : 'Here is your approved spending breakdown by category.';
-    return {
-      handled: true,
-      cleanResponse: `${text}\n\n${serverToolData.categoryBlock}`,
-      proposedActions: [],
-    };
-  }
-
-  if (intent === 'recent' && recentTxns?.length) {
-    const preview = recentTxns.slice(0, 12).map(t => ({
-      note: t.note || t.category || '',
-      amount: t.amount,
-      type: t.type,
-      category: t.category,
-    }));
-    const text = isBn
-      ? `সর্বশেষ ${preview.length}টি লেনদেন নিচে দেখুন।`
-      : `Here are your latest ${preview.length} transactions.`;
-    return {
-      handled: true,
-      cleanResponse: `${text}\n\n${formatTransactionsDataBlock(preview)}`,
-      proposedActions: [],
-    };
-  }
-
-  if (intent === 'help') {
-    const text = isBn
-      ? 'আপনি বলতে পারেন: "আমার ব্যালেন্স দেখাও", "ক্যাটাগরি অনুযায়ী খরচ", "personal book-এ ৫০ টাকা rickshaw খরচ"। লেনদেন approve করতে হবে।'
-      : 'Try: "show my balance", "spending by category", or "add 50 taka rickshaw expense to personal book". Transactions need your approval.';
-    return { handled: true, cleanResponse: text, proposedActions: [] };
-  }
-
-  if (intent === 'transaction' && agentCtx.transactionHints?.amount && agentCtx.transactionHints?.bookId) {
+  // Only fast-path: structured transaction proposal (approval UI). All conversational text → LLM.
+  if (intent === 'transaction' && transactionHints?.amount && transactionHints?.bookId) {
     const hints = agentCtx.transactionHints;
     const book = await prisma.book.findFirst({
       where: { id: hints.bookId },
@@ -5399,7 +5785,8 @@ const prepareAiAgentRequest = async (userId, bookId, messages) => {
   );
   const transactionHints = parseTransactionHints(lastUserMessage, booksForAiTxn, contextBookId);
   const activeBookEntry = booksWithOrg.find(x => x.book.id === contextBookId);
-  const recommendedTemperature = ['balance', 'category', 'recent', 'transaction', 'help'].includes(intent) ? 0.2 : 0.45;
+  const recommendedTemperature =
+    intent === 'transaction' ? 0.35 : intent === 'general' ? 0.72 : 0.58;
 
   const orgSummary = userOrgs
     .filter(m => !m.organization.isPersonal)
@@ -5430,6 +5817,15 @@ const prepareAiAgentRequest = async (userId, bookId, messages) => {
     const categories = await fetchAiCategorySummary(userId, contextBookId);
     serverToolData.categoryBlock = formatCategoryDataBlock(categories);
   }
+  if (intent === 'recent' && recentTxns?.length) {
+    const preview = recentTxns.slice(0, 12).map((t) => ({
+      note: t.note || t.category || '',
+      amount: t.amount,
+      type: t.type,
+      category: t.category,
+    }));
+    serverToolData.recentBlock = formatTransactionsDataBlock(preview);
+  }
 
   const hintsSection = transactionHints.amount
     ? `PARSED FROM USER MESSAGE: amount=${transactionHints.amount} type=${transactionHints.type} category=${transactionHints.category} bookId=${transactionHints.bookId || 'MISSING'} bookName="${transactionHints.bookName || ''}"`
@@ -5442,15 +5838,27 @@ const prepareAiAgentRequest = async (userId, bookId, messages) => {
     intent === 'category' && serverToolData.categoryBlock
       ? `VERIFIED CATEGORY DATA (copy this DATA block exactly, do not invent numbers):\n${serverToolData.categoryBlock}`
       : null,
+    intent === 'recent' && serverToolData.recentBlock
+      ? `VERIFIED RECENT TRANSACTIONS (copy this DATA block exactly):\n${serverToolData.recentBlock}`
+      : null,
   ].filter(Boolean).join('\n\n');
 
   const today = new Date().toISOString().split('T')[0];
-  const systemPrompt = `You are Hisab Pata AI — finance assistant ONLY for the Hisab Pata ledger app.
+  const matchedBookHint = matchBookFromUserMessage(lastUserMessage, booksWithOrg);
+  const matchedBookLine = matchedBookHint
+    ? `LIKELY BOOK FROM USER WORDS: "${matchedBookHint.book.name}" (ID:${matchedBookHint.book.id}, Balance:${matchedBookHint.book.balance})`
+    : 'LIKELY BOOK FROM USER WORDS: none detected — use ACTIVE BOOK or ask which book.';
+
+  const systemPrompt = `You are Hisab Pata AI — the user's friendly ledger assistant inside the Hisab Pata app.
 
 SCOPE & PERSONA:
-- You are a friendly, polite, and slightly witty finance assistant. Always use a warm, respectful tone (use "আপনি" in Bangla), and occasionally add a touch of light, friendly humor where appropriate.
-- Answer ONLY about this app's books, balances, transactions, categories, approvals, org rules.
-- If the user asks anything unrelated, politely and gently remind them that you are here to help with their Hisab Pata accounts.
+- Warm, conversational Bangla/English (use "আপনি" in Bangla). Light humor is welcome when off-topic — never rude.
+- Write every reply in your own words. NEVER repeat the same stock sentence or policy boilerplate across turns.
+- Casual chat is allowed: greet, small talk, then gently tie back to their books if useful.
+- If unclear, guess from USER BOOKS and ask naturally: "আপনি কি [খাতা] নিয়ে জানতে চাচ্ছেন?" — wording must vary each time.
+- Map informal words: জমা/টাকা আছে/বাকি → book balance; উইকনোট → book name with week/note.
+- ${matchedBookLine}
+- Off-topic (weather, recipes, sports): short playful reply + redirect to ledger — unique phrasing each time.
 - Never discuss other products or your underlying AI model.
 
 RULES:
@@ -5459,6 +5867,7 @@ RULES:
 - Use book IDs from USER BOOKS for transaction actions.
 - If the user asks to process pending audio notes, read the PENDING AUDIO NOTES section. For clear notes, create transaction action blocks and INCLUDE "audioNoteId":"<id>" inside the data.
 - If the user asks to SEE or LIST pending audio notes, you MUST include the exact AUDIO NOTES DATA BLOCK in your response so the UI can render it.
+- QUICK NOTES: If the user message starts with [কুইক নোট] or [QUICK NOTES], those are voice memos from the Quick Notes feature (not PENDING AUDIO NOTES). When asked to read/analyze them: summarize each note with text; for clear amounts+category hints propose create_transaction per note using bookId from BOOKS; never invent amounts; skip "processing" lines; org fund expenses on personal book use orgFundId when a fund org book is named.
 
 USER: ${userData?.name || 'User'}
 ACTIVE BOOK: ${activeBookEntry ? `"${activeBookEntry.book.name}" (${activeBookEntry.book.id})` : 'None'}
@@ -5472,11 +5881,11 @@ RECENT TXNS: ${txnSummary}
 ${hintsSection}
 ${verifiedDataSection ? `\nVERIFIED DATA:\n${verifiedDataSection}\n` : ''}
 
-TRANSACTIONS: To create a transaction, you MUST have the exact amount, the book name, AND a highly detailed note/description. If the user provides a short or vague note (e.g., "50 tk for transport"), you MUST ask them for a detailed description (e.g., "how did you travel? who was with you? what is the exact reason?"). DO NOT create the action block until the user provides a detailed, clear explanation.
+TRANSACTIONS: Need amount + book + a sensible note (short notes like "rickshaw to office" are OK). Ask ONE clarifying question only if amount or book is missing.
 
 RESPONSE:
-- Be friendly, conversational, and occasionally use light humor to make accounting feel less boring. Keep it reasonably concise. Use Bangla or English based on the user's language. No markdown formatting.
-- Include VERIFIED DATA blocks unchanged for balance/category.
+- Answer the actual question first. Phrase balance/category/recent answers naturally using VERIFIED DATA numbers — do not invent figures.
+- Be concise, human, and varied. Include VERIFIED DATA blocks unchanged when provided (balance/category/transactions).
 - For new transactions with amount+book: add [DATA type:transactions] preview + action block:
 \`\`\`action
 {"action":"create_transaction","data":{"bookId":"<id>","type":"expense","amount":500,"category":"Transport","note":"...","dateTime":"${today}"}}
@@ -5489,7 +5898,7 @@ DATA formats:
 AUDIO NOTES DATA BLOCK (copy this if user asks to see audios):
 ${audioNotesDataBlock}
 
-If amount, book, or a DETAILED note is missing, ask ONE clarifying question politely. No action blocks yet.`;
+If amount or book is missing for a new transaction, ask ONE short clarifying question. No action blocks until you have both.`;
 
   return {
     systemPrompt,
@@ -5601,6 +6010,11 @@ const finalizeAiAgentResponse = async (aiResponseText, { contextBookId, userId, 
       ? `${cleanResponse}\n\n${serverToolData.categoryBlock}`
       : serverToolData.categoryBlock;
   }
+  if (intent === 'recent' && serverToolData?.recentBlock && !cleanResponse.includes('[DATA type:transactions]')) {
+    cleanResponse = cleanResponse
+      ? `${cleanResponse}\n\n${serverToolData.recentBlock}`
+      : serverToolData.recentBlock;
+  }
 
   return { cleanResponse: cleanResponse.trim(), proposedActions };
 };
@@ -5658,6 +6072,26 @@ app.post('/api/ai/agent/prepare', authenticateToken, async (req, res) => {
       });
     }
 
+    const clarify = tryClarifyAmbiguousAiResponse(messages, agentCtx);
+    if (clarify.handled) {
+      await saveAiChatTurn({
+        userId: req.user.id,
+        userMessage: getLastUserMessage(messages),
+        assistantMessage: clarify.cleanResponse,
+        bookId: contextBookId,
+        model: null,
+        provider: null,
+        intent: 'clarify',
+      });
+      return res.json({
+        mode: 'deterministic',
+        response: clarify.cleanResponse,
+        proposedActions: [],
+        contextBookId,
+        intent: 'clarify',
+      });
+    }
+
     const offTopic = tryOffTopicAiResponse(messages, agentCtx);
     if (offTopic.handled) {
       await saveAiChatTurn({
@@ -5681,6 +6115,7 @@ app.post('/api/ai/agent/prepare', authenticateToken, async (req, res) => {
     const toolData = {};
     if (serverToolData?.balanceBlock) toolData.balanceBlock = serverToolData.balanceBlock;
     if (serverToolData?.categoryBlock) toolData.categoryBlock = serverToolData.categoryBlock;
+    if (serverToolData?.recentBlock) toolData.recentBlock = serverToolData.recentBlock;
 
     return res.json({
       mode: 'llm',
@@ -5788,6 +6223,23 @@ app.post('/api/ai/agent', authenticateToken, async (req, res) => {
       return res.json({
         response: deterministic.cleanResponse,
         proposedActions: deterministic.proposedActions || [],
+      });
+    }
+
+    const clarifyFin = tryClarifyAmbiguousAiResponse(messages, agentCtx);
+    if (clarifyFin.handled) {
+      await saveAiChatTurn({
+        userId: req.user.id,
+        userMessage: getLastUserMessage(messages),
+        assistantMessage: clarifyFin.cleanResponse,
+        bookId: contextBookId,
+        model,
+        provider,
+        intent: 'clarify',
+      });
+      return res.json({
+        response: clarifyFin.cleanResponse,
+        proposedActions: [],
       });
     }
 
@@ -5970,6 +6422,22 @@ app.post('/api/ai/agent/stream', authenticateToken, async (req, res) => {
       if (deterministic.proposedActions?.length) {
         sendEvent('actions', { actions: deterministic.proposedActions });
       }
+      sendEvent('done', {});
+      return res.end();
+    }
+
+    const clarifyStream = tryClarifyAmbiguousAiResponse(messages, agentCtx);
+    if (clarifyStream.handled) {
+      await saveAiChatTurn({
+        userId: req.user.id,
+        userMessage: getLastUserMessage(messages),
+        assistantMessage: clarifyStream.cleanResponse,
+        bookId: contextBookId,
+        model,
+        provider,
+        intent: 'clarify',
+      });
+      sendEvent('clean', { response: clarifyStream.cleanResponse });
       sendEvent('done', {});
       return res.end();
     }
