@@ -5740,43 +5740,6 @@ const prepareAiAgentRequest = async (userId, bookId, messages) => {
     contextBookId = (allBooks.find(b => b.isDefault) || allBooks[0]).id;
   }
 
-  const recentTxns = contextBookId
-    ? await prisma.transaction.findMany({
-        where: { bookId: contextBookId },
-        orderBy: { dateTime: 'desc' },
-        take: 8,
-      })
-    : [];
-
-  const pendingApprovalCount = await prisma.transaction.count({
-    where: {
-      reconStatus: { in: ['pending_org', 'pending_recipient', 'pending'] },
-      book: { organization: { members: { some: { userId, status: 'active' } } } },
-    },
-  });
-
-  let pendingAudioNotes = [];
-  try {
-    pendingAudioNotes = await prisma.audioNote.findMany({
-      where: { userId, status: 'pending' },
-      orderBy: { recordedAt: 'asc' },
-    });
-  } catch (audioErr) {
-    console.warn('[AI Agent] AudioNote query skipped:', audioErr.message);
-  }
-  const audioNotesPayload = pendingAudioNotes.map(n => ({
-    id: n.id,
-    audioUrl: n.audioUrl || '',
-    text: n.text || 'Unclear audio',
-    recordedAt: new Date(n.recordedAt).toISOString()
-  }));
-  const audioNotesDataBlock = pendingAudioNotes.length > 0 
-    ? `[DATA type:audio_notes] ${JSON.stringify(audioNotesPayload)} [/DATA]`
-    : 'None';
-  const audioNotesSummary = pendingAudioNotes.length > 0
-    ? pendingAudioNotes.map(n => `- ID:${n.id} [${new Date(n.recordedAt).toLocaleTimeString()}] ${n.text || "Unclear audio"}`).join('\n')
-    : 'None';
-
   const userData = await prisma.user.findUnique({ where: { id: userId } });
   const intent = detectAiIntent(messages);
   const lastUserMessage = getLastUserMessage(messages);
@@ -5788,126 +5751,40 @@ const prepareAiAgentRequest = async (userId, bookId, messages) => {
   const recommendedTemperature =
     intent === 'transaction' ? 0.35 : intent === 'general' ? 0.72 : 0.58;
 
-  const orgSummary = userOrgs
-    .filter(m => !m.organization.isPersonal)
-    .map(m => `Org:"${m.organization.name}" Role:${m.role}`)
-    .join(' | ') || 'None';
-
-  const booksSummary = booksWithOrg
-    .map(({ book, orgName, isPersonal, role }) =>
-      `- ID:${book.id} Name:"${book.name}" Balance:${book.balance} BDT Org:"${isPersonal ? 'Personal' : orgName}" Role:${role}`)
-    .join('\n');
-
-  const txnSummary = recentTxns
-    .map(t => `${t.type} ${t.amount} ${t.category || ''} ${(t.note || '').slice(0, 40)}`)
-    .join(' | ') || 'None';
-
-  const serverToolData = {};
-  const balanceBooks = booksWithOrg.map(({ book, orgName, isPersonal }) => ({
-    name: book.name,
-    balance: book.balance,
-    organization: isPersonal ? 'Personal' : orgName,
-  }));
-
-  if (intent === 'balance') {
-    serverToolData.balanceBlock = formatBalanceDataBlock(balanceBooks);
-    serverToolData.balanceBooks = balanceBooks;
-  }
-  if (intent === 'category') {
-    const categories = await fetchAiCategorySummary(userId, contextBookId);
-    serverToolData.categoryBlock = formatCategoryDataBlock(categories);
-  }
-  if (intent === 'recent' && recentTxns?.length) {
-    const preview = recentTxns.slice(0, 12).map((t) => ({
-      note: t.note || t.category || '',
-      amount: t.amount,
-      type: t.type,
-      category: t.category,
-    }));
-    serverToolData.recentBlock = formatTransactionsDataBlock(preview);
-  }
-
-  const hintsSection = transactionHints.amount
-    ? `PARSED FROM USER MESSAGE: amount=${transactionHints.amount} type=${transactionHints.type} category=${transactionHints.category} bookId=${transactionHints.bookId || 'MISSING'} bookName="${transactionHints.bookName || ''}"`
-    : 'PARSED FROM USER MESSAGE: amount not detected';
-
-  const verifiedDataSection = [
-    intent === 'balance' && serverToolData.balanceBlock
-      ? `VERIFIED BALANCE DATA (copy this DATA block exactly, do not invent numbers):\n${serverToolData.balanceBlock}`
-      : null,
-    intent === 'category' && serverToolData.categoryBlock
-      ? `VERIFIED CATEGORY DATA (copy this DATA block exactly, do not invent numbers):\n${serverToolData.categoryBlock}`
-      : null,
-    intent === 'recent' && serverToolData.recentBlock
-      ? `VERIFIED RECENT TRANSACTIONS (copy this DATA block exactly):\n${serverToolData.recentBlock}`
-      : null,
-  ].filter(Boolean).join('\n\n');
-
   const today = new Date().toISOString().split('T')[0];
-  const matchedBookHint = matchBookFromUserMessage(lastUserMessage, booksWithOrg);
-  const matchedBookLine = matchedBookHint
-    ? `LIKELY BOOK FROM USER WORDS: "${matchedBookHint.book.name}" (ID:${matchedBookHint.book.id}, Balance:${matchedBookHint.book.balance})`
-    : 'LIKELY BOOK FROM USER WORDS: none detected — use ACTIVE BOOK or ask which book.';
 
-  const systemPrompt = `You are Hisab Pata AI — the user's friendly ledger assistant inside the Hisab Pata app.
+  const systemPrompt = `You are Hisab Pata AI — the user's friendly ledger assistant.
 
 SCOPE & PERSONA:
-- Warm, conversational Bangla/English (use "আপনি" in Bangla). Light humor is welcome when off-topic — never rude.
-- Write every reply in your own words. NEVER repeat the same stock sentence or policy boilerplate across turns.
-- Casual chat is allowed: greet, small talk, then gently tie back to their books if useful.
-- If unclear, guess from USER BOOKS and ask naturally: "আপনি কি [খাতা] নিয়ে জানতে চাচ্ছেন?" — wording must vary each time.
-- Map informal words: জমা/টাকা আছে/বাকি → book balance; উইকনোট → book name with week/note.
-- ${matchedBookLine}
-- Off-topic (weather, recipes, sports): short playful reply + redirect to ledger — unique phrasing each time.
-- Never discuss other products or your underlying AI model.
+- Warm, conversational Bangla/English (use "আপনি").
+- Be very concise.
+- ACTIVE BOOK: ${activeBookEntry ? `"${activeBookEntry.book.name}" (${activeBookEntry.book.id})` : 'None'}
+- USER: ${userData?.name || 'User'}
 
-RULES:
-- Personal org is not a real organization. Org book outflow is Send only.
-- Never say a transaction is saved; say it is ready for user approval.
-- Use book IDs from USER BOOKS for transaction actions.
-- If the user asks to process pending audio notes, read the PENDING AUDIO NOTES section. For clear notes, create transaction action blocks and INCLUDE "audioNoteId":"<id>" inside the data.
-- If the user asks to SEE or LIST pending audio notes, you MUST include the exact AUDIO NOTES DATA BLOCK in your response so the UI can render it.
-- QUICK NOTES: If the user message starts with [কুইক নোট] or [QUICK NOTES], those are voice memos from the Quick Notes feature (not PENDING AUDIO NOTES). When asked to read/analyze them: summarize each note with text; for clear amounts+category hints propose create_transaction per note using bookId from BOOKS; never invent amounts; skip "processing" lines; org fund expenses on personal book use orgFundId when a fund org book is named.
+AVAILABLE TOOLS:
+To use a tool, output EXACTLY the command on its own line. Do not output anything else if you are calling a tool.
+1. [FETCH_RULE: <id>] -> Fetch a specific rule. Available rules: id-01-transaction, id-02-design
+2. [FETCH_NOTES: <count>] -> Fetch recent user quick notes (voice memos). e.g. [FETCH_NOTES: 5]
+3. [FETCH_BALANCE] -> Fetch all book balances.
+4. [FETCH_RECENT_TXN] -> Fetch recent transactions for the active book.
 
-USER: ${userData?.name || 'User'}
-ACTIVE BOOK: ${activeBookEntry ? `"${activeBookEntry.book.name}" (${activeBookEntry.book.id})` : 'None'}
-PENDING APPROVALS: ${pendingApprovalCount}
-PENDING AUDIO NOTES: 
-${audioNotesSummary}
-ORGS: ${orgSummary}
-BOOKS:
-${booksSummary || 'None'}
-RECENT TXNS: ${txnSummary}
-${hintsSection}
-${verifiedDataSection ? `\nVERIFIED DATA:\n${verifiedDataSection}\n` : ''}
-
-TRANSACTIONS: Need amount + book + a sensible note (short notes like "rickshaw to office" are OK). Ask ONE clarifying question only if amount or book is missing.
-
-RESPONSE:
-- Answer the actual question first. Phrase balance/category/recent answers naturally using VERIFIED DATA numbers — do not invent figures.
-- Be concise, human, and varied. Include VERIFIED DATA blocks unchanged when provided (balance/category/transactions).
-- For new transactions with amount+book: add [DATA type:transactions] preview + action block:
+TRANSACTIONS (STRICT RULES):
+- You MUST extract: amount, category, and a detailed description (What, where, how, why).
+- If any of these 3 are missing, ASK the user for them. Do not create the transaction block.
+- Format for action:
 \`\`\`action
-{"action":"create_transaction","data":{"bookId":"<id>","type":"expense","amount":500,"category":"Transport","note":"...","dateTime":"${today}"}}
+{"action":"create_transaction","data":{"bookId":"<id>","type":"expense","amount":500,"category":"Transport","description":"Rickshaw fare to office for meeting","note":"Rickshaw"}}
 \`\`\`
-
-DATA formats:
-[DATA type:balance] [{"book":"Name","balance":1000,"org":"OrgName"}] [/DATA]
-[DATA type:category] [{"category":"Food","amount":500,"count":3,"percentage":40}] [/DATA]
-[DATA type:transactions] [{"note":"...","amount":50,"type":"expense","category":"Transport"}] [/DATA]
-AUDIO NOTES DATA BLOCK (copy this if user asks to see audios):
-${audioNotesDataBlock}
-
-If amount or book is missing for a new transaction, ask ONE short clarifying question. No action blocks until you have both.`;
+`;
 
   return {
     systemPrompt,
     contextBookId,
     intent,
-    serverToolData,
+    serverToolData: {},
     booksWithOrg,
-    recentTxns,
-    pendingApprovalCount,
+    recentTxns: [],
+    pendingApprovalCount: 0,
     transactionHints,
     recommendedTemperature,
   };
@@ -5925,6 +5802,17 @@ const parseAiAgentActions = async (aiResponseText, contextBookId, userId, { onCo
       const actionData = JSON.parse(match[1].trim());
       if (actionData.action === 'create_transaction' && actionData.data) {
         const { bookId: txnBookId, type, amount, category, note, dateTime, contact, recipientUserId, orgFundId, description } = actionData.data;
+        
+        if (!amount || !category || !description) {
+          proposedActions.push({
+            action: 'create_transaction',
+            data: { ...actionData.data },
+            valid: false,
+            reason: 'Missing required strict fields: amount, category, or description',
+          });
+          continue;
+        }
+
         const resolvedNote = resolveAiTransactionNote({
           note,
           description,
@@ -5959,6 +5847,7 @@ const parseAiAgentActions = async (aiResponseText, contextBookId, userId, { onCo
               contact: contact || '',
               recipientUserId: recipientUserId || null,
               orgFundId: orgFundId || null,
+              description: description || '',
             },
             valid: true,
           });
@@ -6366,6 +6255,64 @@ app.post('/api/ai/agent', authenticateToken, async (req, res) => {
     res.status(500).json({ error: detail });
   }
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// AGENT TOOL CALLING ROUTE
+// ─────────────────────────────────────────────────────────────────────────────
+app.post('/api/ai/agent/tool', authenticateToken, async (req, res) => {
+  try {
+    const { toolName, args, bookId } = req.body;
+    
+    if (toolName === 'FETCH_RULE') {
+      const { id } = args || {};
+      if (id === 'id-01-transaction') {
+        return res.json({ result: "Rule 01 - Transactions:\n- Must capture amount.\n- Must categorize properly.\n- Must provide detailed description (what/where/how/why)." });
+      } else if (id === 'id-02-design') {
+        return res.json({ result: "Rule 02 - Design:\n- Provide a beautiful, well-formatted response.\n- Use bold text for numbers." });
+      } else {
+        return res.json({ result: "Rule not found." });
+      }
+    } else if (toolName === 'FETCH_BALANCE') {
+      const userOrgs = await prisma.organizationMember.findMany({
+        where: { userId: req.user.id, status: 'active' },
+        include: { organization: { include: { books: true } } },
+      });
+      const booksWithOrg = userOrgs.flatMap(m =>
+        m.organization.books.map(b => ({
+          book: b,
+          orgName: m.organization.name,
+          isPersonal: m.organization.isPersonal,
+        }))
+      );
+      const balanceBooks = booksWithOrg.map(({ book, orgName, isPersonal }) => ({
+        name: book.name,
+        balance: book.balance,
+        organization: isPersonal ? 'Personal' : orgName,
+      }));
+      return res.json({ result: formatBalanceDataBlock(balanceBooks) });
+    } else if (toolName === 'FETCH_RECENT_TXN') {
+      if (!bookId) return res.json({ result: "No bookId provided." });
+      const recentTxns = await prisma.transaction.findMany({
+        where: { bookId },
+        orderBy: { dateTime: 'desc' },
+        take: 10,
+      });
+      const preview = recentTxns.map((t) => ({
+        note: t.note || t.category || '',
+        amount: t.amount,
+        type: t.type,
+        category: t.category,
+      }));
+      return res.json({ result: formatTransactionsDataBlock(preview) });
+    }
+    
+    return res.json({ result: "Unknown tool call." });
+  } catch (error) {
+    console.error('[AI Tool] Error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 
 // ─────────────────────────────────────────────────────────────────────────────
 // AGENTIC AI STREAMING ROUTE — SSE streaming response
