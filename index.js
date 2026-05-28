@@ -16,6 +16,7 @@ require('dotenv').config();
 const { Readable } = require('stream');
 const crypto = require('crypto');
 const sharp = require('sharp');
+const { S3Client, PutObjectCommand, GetObjectCommand } = require('@aws-sdk/client-s3');
 
 // ─── S3-Compatible Object Storage (SeaweedFS S3 / MinIO / Cloudflare R2) ─────
 // Set STORAGE_S3_ENDPOINT in .env to enable. Falls back to local /uploads.
@@ -27,10 +28,27 @@ const sharp = require('sharp');
 //   files/             → generic fallback
 const s3Endpoint  = process.env.STORAGE_S3_ENDPOINT  ? process.env.STORAGE_S3_ENDPOINT.replace(/\/$/, '') : '';
 const s3Bucket    = process.env.STORAGE_S3_BUCKET    || 'hisabpata';
-const s3AccessKey = process.env.STORAGE_S3_ACCESS_KEY || '';
-const s3SecretKey = process.env.STORAGE_S3_SECRET_KEY || '';
+const s3AccessKey = (process.env.STORAGE_S3_ACCESS_KEY || '').trim();
+const s3SecretKey = (process.env.STORAGE_S3_SECRET_KEY || '').trim();
 const s3Region    = process.env.STORAGE_S3_REGION     || 'us-east-1';
+const s3ForcePathStyle = process.env.STORAGE_S3_FORCE_PATH_STYLE !== 'false';
 const useS3       = !!s3Endpoint;
+
+let s3Client = null;
+function getS3Client() {
+  if (!useS3) return null;
+  if (!s3Client) {
+    s3Client = new S3Client({
+      endpoint: s3Endpoint,
+      region: s3Region,
+      forcePathStyle: s3ForcePathStyle,
+      credentials: s3AccessKey && s3SecretKey
+        ? { accessKeyId: s3AccessKey, secretAccessKey: s3SecretKey }
+        : undefined,
+    });
+  }
+  return s3Client;
+}
 
 const S3_FOLDERS = {
   'profile-pictures': 'profile-pictures',
@@ -47,66 +65,40 @@ function resolveS3Folder(requestedFolder, mimetype, filename) {
   return 'files';
 }
 
-// AWS Signature V4 signing for S3 requests
-function signS3Request(method, key, contentType, body, date) {
-  if (!s3AccessKey || !s3SecretKey) return {}; // no-auth mode
-  const datetime = date.toISOString().replace(/[:-]|\.\d{3}/g, '').slice(0, 15) + 'Z';
-  const dateStr  = datetime.slice(0, 8);
-  const host     = new URL(s3Endpoint).host;
-  const bodyHash = crypto.createHash('sha256').update(body).digest('hex');
-  const canonicalHeaders = `content-type:${contentType}\nhost:${host}\nx-amz-content-sha256:${bodyHash}\nx-amz-date:${datetime}\n`;
-  const signedHeaders    = 'content-type;host;x-amz-content-sha256;x-amz-date';
-  const canonicalRequest = [method, `/${s3Bucket}/${key}`, '', canonicalHeaders, signedHeaders, bodyHash].join('\n');
-  const credentialScope  = `${dateStr}/${s3Region}/s3/aws4_request`;
-  const stringToSign     = `AWS4-HMAC-SHA256\n${datetime}\n${credentialScope}\n` +
-                            crypto.createHash('sha256').update(canonicalRequest).digest('hex');
-  const signingKey = ['aws4', s3SecretKey, dateStr, s3Region, 's3', 'aws4_request']
-    .reduce((key, data) => crypto.createHmac('sha256', key).update(data).digest());
-  const signature = crypto.createHmac('sha256', signingKey).update(stringToSign).digest('hex');
-  return {
-    'x-amz-date':           datetime,
-    'x-amz-content-sha256': bodyHash,
-    'Authorization': `AWS4-HMAC-SHA256 Credential=${s3AccessKey}/${credentialScope},SignedHeaders=${signedHeaders},Signature=${signature}`,
-  };
-}
-
 // Upload local file to S3. Returns stored key (folder/filename) or null.
 async function uploadToS3(localPath, filename, mimetype, folder) {
   if (!useS3) return null;
+  const client = getS3Client();
+  if (!client) return null;
   try {
     const resolvedFolder = resolveS3Folder(folder, mimetype, filename);
     let key              = `${resolvedFolder}/${filename}`;
     let contentType      = mimetype || 'application/octet-stream';
     let fileBuffer       = fs.readFileSync(localPath);
-    
-    // Compress images (keep resolution, reduce file size, convert to webp)
+
     if (contentType.startsWith('image/')) {
       try {
         fileBuffer = await sharp(fileBuffer)
-          .webp({ quality: 85 }) // High quality WebP (good for documents too)
+          .webp({ quality: 85 })
           .toBuffer();
-        
         contentType = 'image/webp';
-        // replace extension with .webp
-        const newFilename = filename.replace(/\.[^/.]+$/, ".webp");
+        const newFilename = filename.replace(/\.[^/.]+$/, '.webp');
         key = `${resolvedFolder}/${newFilename}`;
       } catch (err) {
         console.error('Sharp compression failed, falling back to original:', err);
       }
     }
 
-    const now            = new Date();
-    const authHeaders    = signS3Request('PUT', key, contentType, fileBuffer, now);
-    const uploadRes = await fetch(`${s3Endpoint}/${s3Bucket}/${key}`, {
-      method:  'PUT',
-      headers: { 'Content-Type': contentType, ...authHeaders },
-      body:    fileBuffer,
-    });
-    if (!uploadRes.ok) throw new Error('S3 upload failed: ' + await uploadRes.text());
+    await client.send(new PutObjectCommand({
+      Bucket: s3Bucket,
+      Key: key,
+      Body: fileBuffer,
+      ContentType: contentType,
+    }));
     try { fs.unlinkSync(localPath); } catch (e) {}
-    return key; // e.g. "profile-pictures/1234567890-abc.jpg"
+    return key;
   } catch (error) {
-    console.error('[S3 Storage] Upload error:', error);
+    console.error('[S3 Storage] Upload error:', error?.message || error);
     return null;
   }
 }
@@ -199,33 +191,18 @@ app.use(express.json());
 if (useS3) {
   app.get('/uploads/:folder/:filename', async (req, res, next) => {
     try {
-      const key     = `${req.params.folder}/${req.params.filename}`;
-      const now     = new Date();
-      const datetime = now.toISOString().replace(/[:-]|\.\d{3}/g, '').slice(0, 15) + 'Z';
-      const host    = new URL(s3Endpoint).host;
-      const bodyHash = 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855'; // empty
-      const headers = { 'x-amz-date': datetime, 'x-amz-content-sha256': bodyHash };
-      if (s3AccessKey && s3SecretKey) {
-        const dateStr = datetime.slice(0, 8);
-        const canonicalHeaders = `host:${host}\nx-amz-content-sha256:${bodyHash}\nx-amz-date:${datetime}\n`;
-        const signedHeaders    = 'host;x-amz-content-sha256;x-amz-date';
-        const canonicalRequest = ['GET', `/${s3Bucket}/${key}`, '', canonicalHeaders, signedHeaders, bodyHash].join('\n');
-        const credentialScope  = `${dateStr}/${s3Region}/s3/aws4_request`;
-        const stringToSign     = `AWS4-HMAC-SHA256\n${datetime}\n${credentialScope}\n` +
-                                  crypto.createHash('sha256').update(canonicalRequest).digest('hex');
-        const signingKey = ['aws4', s3SecretKey, dateStr, s3Region, 's3', 'aws4_request']
-          .reduce((k, d) => crypto.createHmac('sha256', k).update(d).digest());
-        const signature = crypto.createHmac('sha256', signingKey).update(stringToSign).digest('hex');
-        headers['Authorization'] = `AWS4-HMAC-SHA256 Credential=${s3AccessKey}/${credentialScope},SignedHeaders=${signedHeaders},Signature=${signature}`;
-      }
-      const fileRes = await fetch(`${s3Endpoint}/${s3Bucket}/${key}`, { headers });
-      if (!fileRes.ok) return next();
-      const ct = fileRes.headers.get('content-type');
-      const cl = fileRes.headers.get('content-length');
-      if (ct) res.setHeader('Content-Type', ct);
-      if (cl) res.setHeader('Content-Length', cl);
+      const client = getS3Client();
+      if (!client) return next();
+      const key = `${req.params.folder}/${req.params.filename}`;
+      const result = await client.send(new GetObjectCommand({
+        Bucket: s3Bucket,
+        Key: key,
+      }));
+      if (!result.Body) return next();
+      if (result.ContentType) res.setHeader('Content-Type', result.ContentType);
+      if (result.ContentLength) res.setHeader('Content-Length', String(result.ContentLength));
       res.setHeader('Cache-Control', 'public, max-age=31536000');
-      Readable.fromWeb(fileRes.body).pipe(res);
+      result.Body.pipe(res);
     } catch (e) { next(); }
   });
 }
@@ -250,6 +227,7 @@ app.get('/api/health', (_req, res) => {
       bucket: useS3 ? s3Bucket : null,
       endpointConfigured: !!s3Endpoint,
       credentialsConfigured: !!(s3AccessKey && s3SecretKey),
+      forcePathStyle: useS3 ? s3ForcePathStyle : null,
     },
   });
 });
