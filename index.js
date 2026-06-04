@@ -5717,17 +5717,17 @@ INSTRUCTIONS:
 
 TRANSACTIONS:
 - ALL fields are strictly MANDATORY: amount, category, description, and note.
-- DESCRIPTION MUST BE VERY DETAILED:
-  * Transport (e.g. Rickshaw, Uber, Bus): You must ask "কোথায় থেকে কোথায় গিয়েছিলেন? কেন গিয়েছিলেন? সাথে কি কেউ ছিল?" (From where to where? Why? Anyone with you?). Do NOT accept simple "Rickshaw fare" or "transport cost".
-  * Food/Restaurant: You must ask "কোথায় খেয়েছেন? কার সাথে? কোনো উপলক্ষ ছিল?" (Where did you eat? With whom? Any occasion?).
-  * Other categories: Ask for specific contextual details.
+- DESCRIPTION MUST BE VERY DETAILED (INCLUDING WORK/PURPOSE CONTEXT):
+  * Transport (e.g. Rickshaw, Uber, Bus): You must ask "কোথায় থেকে কোথায় গিয়েছিলেন? কেন গিয়েছিলেন? কোন কাজের কারণে বা অফিশিয়াল প্রয়োজনে? সাথে কি কেউ ছিল?" (From where to where? Why? For what official work/purpose? Anyone with you?). Do NOT accept simple travel endpoints.
+  * Food/Restaurant: You must ask "কোথায় খেয়েছেন? কার সাথে? কোন অফিসের কাজ, প্রোগ্রাম বা মেহমানদারির কারণে এই খরচ করা হয়েছে?" (Where did you eat? With whom? Under what office work, event, or guest hospitality?).
+  * Other categories: Always ask for the detailed purpose/work context.
 - TWO-STEP CONFIRMATION FLOW (STRICT REQUIREMENT):
-  1. First, ask conversational questions to gather all the mandatory description details.
+  1. First, ask conversational questions to gather all the mandatory description details (including the official work purpose).
   2. Once all details are gathered, summarize them and explicitly ask the user for confirmation (e.g., "আমি কি এটি আপনার ডেমো খাতায় যোগ করব?").
   3. ONLY output the JSON action block AFTER the user explicitly confirms (e.g., says "yes", "হ্যাঁ", "করো", "যোগ করো"). Do NOT output the action block before the user says yes.
 - Once confirmed by the user, output the action block using this exact format:
 \`\`\`action
-{"action":"create_transaction","data":{"bookId":"<id>","type":"expense","amount":500,"category":"Transport","description":"Rickshaw fare from Dhanmondi to Gulshan for business meeting with Rahim","note":"Rickshaw"}}
+{"action":"create_transaction","data":{"bookId":"<id>","type":"expense","amount":500,"category":"Transport","description":"Rickshaw fare from Dhanmondi to Gulshan to print program banner with Rahim","note":"Rickshaw"}}
 \`\`\`
 `;
 
