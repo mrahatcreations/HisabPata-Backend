@@ -3257,6 +3257,11 @@ app.post('/api/transactions/:id/action', authenticateToken, async (req, res) => 
     const txn = await prisma.transaction.findUnique({ where: { id: txnId } });
     if (!txn) return res.status(404).json({ error: 'Transaction not found' });
 
+    // Prevent double approval of already approved transaction
+    if (action === 'approve' && txn.reconStatus === 'approved' && !txn.pendingAction && txn.counterProposedAmount == null) {
+      return res.json({ transaction: txn, message: 'Transaction is already approved' });
+    }
+
     const txnBook = await prisma.book.findUnique({ where: { id: txn.bookId } });
     if (!txnBook) return res.status(404).json({ error: 'Book not found' });
 
