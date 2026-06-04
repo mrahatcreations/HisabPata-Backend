@@ -5695,29 +5695,61 @@ const prepareAiAgentRequest = async (userId, bookId, messages) => {
 
   const today = new Date().toISOString().split('T')[0];
 
-  const systemPrompt = `You are a real human working as the accountant and ledger assistant for the user. Do NOT act like a typical AI.
+  let dataContextSection = '';
+  const serverToolData = {};
 
-SCOPE & PERSONA:
-- Reply in extremely short, casual, and highly conversational Bangla/English (use "আপনি" or "তুমি" depending on the context).
-- Use humor and fun, but act perfectly like a real person chatting. Do NOT use typical AI phrases like "I can help with that" or "Here is the summary".
-- Get straight to the point. No unnecessary words or robotic politeness. For example, if someone says "হ্যালো", reply with something natural like "হাই, কি খবর! হিসাবপাতি করতে হবে নাকি?"
-- Your ultimate goal is to make the user confused whether you are an AI or a real human sitting on the other side.
-- ACTIVE BOOK: ${activeBookEntry ? `"${activeBookEntry.book.name}" (${activeBookEntry.book.id})` : 'None'}
+  if (intent === 'balance') {
+    const balanceBlock = formatBalanceDataBlock(allBooks);
+    serverToolData.balanceBlock = balanceBlock;
+    dataContextSection += `\nREAL-TIME USER BALANCE DATA:\n${balanceBlock}\n`;
+  } else if (intent === 'recent' && contextBookId) {
+    const txns = await prisma.transaction.findMany({
+      where: { bookId: contextBookId },
+      orderBy: { dateTime: 'desc' },
+      take: 8,
+    });
+    const recentBlock = formatTransactionsDataBlock(txns);
+    serverToolData.recentBlock = recentBlock;
+    dataContextSection += `\nREAL-TIME RECENT TRANSACTIONS:\n${recentBlock}\n`;
+  } else if (intent === 'category' && contextBookId) {
+    const txns = await prisma.transaction.findMany({
+      where: { bookId: contextBookId },
+      orderBy: { dateTime: 'desc' },
+      take: 50,
+    });
+    const breakdown = {};
+    txns.filter(t => t.type === 'expense').forEach(t => {
+      const cat = t.category || 'General';
+      breakdown[cat] = (breakdown[cat] || 0) + t.amount;
+    });
+    const payload = Object.entries(breakdown).map(([cat, amt]) => ({ category: cat, amount: amt }));
+    const categoryBlock = `[DATA type:category]\n${JSON.stringify(payload)}\n[/DATA]`;
+    serverToolData.categoryBlock = categoryBlock;
+    dataContextSection += `\nREAL-TIME SPENDING BREAKDOWN BY CATEGORY:\n${categoryBlock}\n`;
+  }
+
+  const systemPrompt = `You are a casual human accountant & ledger assistant. Answer very concisely to save token bandwidth.
+
+PERSONA:
+- Converse naturally in short Bangla/English (casual & fun). Avoid typical AI phrases or long preambles.
+- Talk directly to the user like a friend. Get straight to the point.
 - USER: ${userData?.name || 'User'}
+- TODAY: ${today}
+- ACTIVE BOOK: ${activeBookEntry ? `"${activeBookEntry.book.name}" (${activeBookEntry.book.id})` : 'None'}
+${dataContextSection}
+INSTRUCTIONS:
+- Do NOT use tools if the data needed is already present in the REAL-TIME context above. Just read it and reply immediately.
+- To fetch extra missing data, write the tool command on its own line:
+  1. [FETCH_RULE: <id>] -> Rules (id-01-transaction, id-02-design)
+  2. [FETCH_NOTES: <count>] -> Quick audio notes
+  3. [FETCH_BALANCE] -> Balances (only if missing in context)
+  4. [FETCH_RECENT_TXN] -> Active book recent txns (only if missing in context)
 
-AVAILABLE TOOLS:
-To use a tool, output EXACTLY the command on its own line. Do not output anything else if you are calling a tool.
-1. [FETCH_RULE: <id>] -> Fetch a specific rule. Available rules: id-01-transaction, id-02-design
-2. [FETCH_NOTES: <count>] -> Fetch recent user quick notes (voice memos). e.g. [FETCH_NOTES: 5]
-3. [FETCH_BALANCE] -> Fetch all book balances.
-4. [FETCH_RECENT_TXN] -> Fetch recent transactions for the active book.
-
-TRANSACTIONS (STRICT RULES):
-- You MUST extract: amount, category, and a detailed description (What, where, how, why).
-- If any of these 3 are missing, ASK the user for them. Do not create the transaction block.
-- Format for action:
+TRANSACTIONS:
+- You must extract: amount, category, description. If any of these are missing, ask the user.
+- If ready, output EXACTLY this format:
 \`\`\`action
-{"action":"create_transaction","data":{"bookId":"<id>","type":"expense","amount":500,"category":"Transport","description":"Rickshaw fare to office for meeting","note":"Rickshaw"}}
+{"action":"create_transaction","data":{"bookId":"<id>","type":"expense","amount":500,"category":"Transport","description":"Rickshaw fare","note":"Rickshaw"}}
 \`\`\`
 `;
 
@@ -5725,7 +5757,7 @@ TRANSACTIONS (STRICT RULES):
     systemPrompt,
     contextBookId,
     intent,
-    serverToolData: {},
+    serverToolData,
     transactionHints,
     recommendedTemperature,
   };
