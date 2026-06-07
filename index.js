@@ -2237,7 +2237,8 @@ app.delete('/api/books/:bookId', authenticateToken, async (req, res) => {
 // Create Transaction (supports org fund handshake for "Send" category and book-based vouchers)
 app.post('/api/transactions', authenticateToken, async (req, res) => {
   try {
-    const { bookId, amount, type, note, category, contact, recipientUserId, recipientOrgId, orgFundId, imageUrl, clientRef, audioNoteId } = req.body;
+    const { bookId, amount, type, note, category, contact, recipientUserId, recipientOrgId, orgFundId: _orgFundId, fundBookId, imageUrl, clientRef, audioNoteId } = req.body;
+    const orgFundId = _orgFundId || fundBookId || null;
 
     if (!bookId || !amount || !type) {
       return res.status(400).json({ error: 'BookId, amount, and type are required' });
