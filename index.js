@@ -1,6 +1,6 @@
 const express = require('express');
 const http = require('http');
-const { WebSocketServer } = require('ws');
+const { WebSocketServer, WebSocket } = require('ws');
 const cors = require('cors');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
@@ -1923,7 +1923,7 @@ app.get('/api/user/profile', authenticateToken, async (req, res) => {
       where: { id: { in: orgIds } },
       include: {
         books: true,
-        members: { where: { status: 'active' }, include: { user: { select: { id: true, name: true } } } },
+        members: { where: { status: 'active' }, include: { user: { select: { id: true, name: true, avatarUrl: true } } } },
       }
     });
 
@@ -1953,7 +1953,7 @@ app.get('/api/user/profile', authenticateToken, async (req, res) => {
         role: activeMemberships.find(m => m.organizationId === o.id)?.role || 'member',
         status: 'active',
         books: o.books,
-        members: o.members.map(m => ({ id: m.user.id, name: m.user.name, role: m.role, userId: m.userId })),
+        members: o.members.map(m => ({ id: m.user.id, name: m.user.name, role: m.role, userId: m.userId, avatarUrl: m.user.avatarUrl })),
       })),
       pendingOrganizations: pendingOrgs.map(o => ({
         id: o.id,
@@ -1983,7 +1983,7 @@ app.get('/api/users/search', authenticateToken, async (req, res) => {
           { phoneNumber: { endsWith: q.slice(-10) } },
         ],
       },
-      select: { id: true, name: true, phoneNumber: true, email: true },
+      select: { id: true, name: true, phoneNumber: true, email: true, avatarUrl: true },
       take: 20,
     });
 
@@ -2011,7 +2011,7 @@ app.get('/api/org/members', authenticateToken, async (req, res) => {
     const orgMembers = await prisma.organizationMember.findMany({
       where: { organizationId: { in: orgIds }, status: 'active' },
       include: {
-        user: { select: { id: true, name: true, phoneNumber: true, email: true } },
+        user: { select: { id: true, name: true, phoneNumber: true, email: true, avatarUrl: true } },
         organization: { select: { id: true, name: true } },
       },
     });
@@ -2032,6 +2032,7 @@ app.get('/api/org/members', authenticateToken, async (req, res) => {
         name: m.user.name,
         phoneNumber: m.user.phoneNumber,
         email: m.user.email,
+        avatarUrl: m.user.avatarUrl,
         role: m.role,
       });
     }
@@ -4932,7 +4933,7 @@ app.get('/api/org/:orgId', authenticateToken, async (req, res) => {
     const org = await prisma.organization.findUnique({
       where: { id: req.params.orgId },
       include: {
-        members: { include: { user: { select: { id: true, name: true, email: true, phoneNumber: true } } } },
+        members: { include: { user: { select: { id: true, name: true, email: true, phoneNumber: true, avatarUrl: true } } } },
         books: { select: { id: true, name: true, balance: true } },
       }
     });
@@ -4959,6 +4960,7 @@ app.get('/api/org/:orgId', authenticateToken, async (req, res) => {
         name: m.user.name,
         email: m.user.email,
         phone: m.user.phoneNumber,
+        avatarUrl: m.user.avatarUrl,
         role: m.role,
         permissions: m.permissions,
         joinedAt: m.createdAt,
@@ -7122,6 +7124,15 @@ const wss = new WebSocketServer({ server });
 const userClients = new Map(); // userId -> Set<WebSocket>
 
 wss.on('connection', (ws, req) => {
+  const url = new URL(req.url, 'http://localhost');
+  const pathname = url.pathname;
+
+  // ASR streaming proxy — Flutter → Backend → BanglaSpeechAPI
+  if (pathname === '/asr/stream') {
+    return handleAsrStream(ws, url);
+  }
+
+  // Existing notification WebSocket
   let userId = null;
 
   ws.on('message', (raw) => {
@@ -7150,6 +7161,98 @@ wss.on('connection', (ws, req) => {
 
   ws.on('error', () => { });
 });
+
+function handleAsrStream(clientWs, url) {
+  const { base, key, enabled } = getAsrConfig();
+  if (!enabled) {
+    clientWs.send(JSON.stringify({ type: 'error', message: 'ASR not configured on server' }));
+    clientWs.close();
+    return;
+  }
+
+  let authenticated = false;
+  let asrWs = null;
+  let closing = false;
+
+  function cleanup() {
+    if (closing) return;
+    closing = true;
+    try { asrWs?.close(); } catch (_) {}
+    try { clientWs.close(); } catch (_) {}
+    asrWs = null;
+  }
+
+  function forwardAudioChunk(data) {
+    if (closing || !asrWs || asrWs.readyState !== WebSocket.OPEN) return;
+    if (Buffer.isBuffer(data)) {
+      asrWs.send(data);
+    }
+  }
+
+  clientWs.on('message', (raw) => {
+    // After auth: forward binary audio directly
+    if (authenticated) {
+      forwardAudioChunk(raw);
+      return;
+    }
+
+    // Before auth: expect JSON auth message
+    try {
+      const msg = JSON.parse(raw.toString());
+      if (msg.type === 'auth') {
+        jwt.verify(msg.token, JWT_SECRET_FINAL, async (err, decoded) => {
+          if (err) {
+            clientWs.send(JSON.stringify({ type: 'error', message: 'Invalid token' }));
+            clientWs.close();
+            return;
+          }
+          authenticated = true;
+          clientWs.send(JSON.stringify({ type: 'auth_ok' }));
+
+          // Connect to BanglaSpeechAPI WebSocket
+          try {
+            const wsBase = base.replace('https://', 'wss://').replace('http://', 'ws://');
+            const wsUrl = `${wsBase}/asr/stream?api_key=${key}`;
+            asrWs = new WebSocket(wsUrl);
+
+            asrWs.on('open', () => {
+              // Any buffered binary messages will be forwarded via on('message')
+            });
+
+            asrWs.on('message', (transcript) => {
+              if (closing) return;
+              clientWs.send(transcript.toString());
+            });
+
+            asrWs.on('close', () => {
+              if (!closing) cleanup();
+            });
+
+            asrWs.on('error', (err) => {
+              console.error('[ASR WS Proxy] Upstream error:', err.message);
+              if (!closing) {
+                clientWs.send(JSON.stringify({ type: 'error', message: 'ASR upstream error' }));
+                cleanup();
+              }
+            });
+
+          } catch (err) {
+            console.error('[ASR WS Proxy] Connection error:', err.message);
+            clientWs.send(JSON.stringify({ type: 'error', message: err.message }));
+            clientWs.close();
+          }
+        });
+      } else {
+        clientWs.send(JSON.stringify({ type: 'error', message: 'Send auth first' }));
+      }
+    } catch (_) {
+      clientWs.send(JSON.stringify({ type: 'error', message: 'Send JSON auth message first' }));
+    }
+  });
+
+  clientWs.on('close', cleanup);
+  clientWs.on('error', cleanup);
+}
 
 function broadcast(data) {
   const msg = JSON.stringify(data);
