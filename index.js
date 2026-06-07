@@ -650,17 +650,17 @@ const buildP1OrgApprovers = (chain, requesterId) => {
   const requesterIsOrg = chain.org.adminIds.includes(requesterId);
   if (requesterIsP1) {
     const rep = pickOrgRepresentative(chain.org.adminIds, requesterId);
-    return { requiredApprovers: rep ? [rep] : [], orgApprovalAnyOf: chain.org.adminIds, chainNote: 'degraded_p1_org' };
+    return { requiredApprovers: rep ? [rep] : chain.org.adminIds, orgApprovalAnyOf: chain.org.adminIds, chainNote: 'degraded_p1_org' };
   }
   if (requesterIsOrg) {
     return {
-      requiredApprovers: chain.p1.userId && chain.p1.userId !== requesterId ? [chain.p1.userId] : [],
+      requiredApprovers: chain.p1.userId ? [chain.p1.userId] : [],
       orgApprovalAnyOf: [],
       chainNote: 'degraded_p1_org',
     };
   }
   const rep = pickOrgRepresentative(chain.org.adminIds, requesterId);
-  return { requiredApprovers: rep ? [rep] : [], orgApprovalAnyOf: chain.org.adminIds, chainNote: 'degraded_p1_org' };
+  return { requiredApprovers: rep ? [rep] : chain.org.adminIds, orgApprovalAnyOf: chain.org.adminIds, chainNote: 'degraded_p1_org' };
 };
 
 const computeRequiredApprovers = (chain, requesterId) => {
@@ -732,7 +732,7 @@ const computeRequiredApprovers = (chain, requesterId) => {
       const requesterIsOrg = chain.org.adminIds.includes(requesterId);
       if (requesterIsP2) {
         const rep = pickOrgRepresentative(chain.org.adminIds, requesterId);
-        return { requiredApprovers: rep ? [rep] : [], orgApprovalAnyOf: chain.org.adminIds, chainNote: 'degraded_org_p2', isOrphan: false };
+        return { requiredApprovers: rep ? [rep] : chain.org.adminIds, orgApprovalAnyOf: chain.org.adminIds, chainNote: 'degraded_org_p2', isOrphan: false };
       }
       if (requesterIsOrg) {
         return {
@@ -3305,7 +3305,7 @@ app.delete('/api/transactions/:id', authenticateToken, async (req, res) => {
           changes: { old: { amount: txn.amount, type: txn.type, category: txn.category, note: txn.note } }
         },
         reverseBalanceOnRequest: true
-      });
+      }, req.user.id);
     });
 
     broadcast({ type: 'data_changed' });
