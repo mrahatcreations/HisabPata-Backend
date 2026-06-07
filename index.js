@@ -747,8 +747,10 @@ const computeRequiredApprovers = (chain, requesterId) => {
         };
       }
       const rep = pickOrgRepresentative(chain.org.adminIds, requesterId);
+      let reqs = [chain.p2.userId, rep].filter((id) => id && id !== requesterId);
+      if (reqs.length === 0) reqs = [requesterId];
       return {
-        requiredApprovers: [chain.p2.userId, rep].filter((id) => id && id !== requesterId),
+        requiredApprovers: reqs,
         orgApprovalAnyOf: chain.org.adminIds,
         chainNote: 'degraded_org_p2',
         isOrphan: false,
@@ -776,8 +778,10 @@ const computeRequiredApprovers = (chain, requesterId) => {
       if (chain.p2.userId) required.push(chain.p2.userId);
     }
 
+    let reqs = finalizeLinkedChangeDeleteApprovers(required, requesterId, chain);
+    if (reqs.length === 0) reqs = [requesterId];
     return {
-      requiredApprovers: finalizeLinkedChangeDeleteApprovers(required, requesterId, chain),
+      requiredApprovers: reqs,
       orgApprovalAnyOf: chain.org.adminIds,
       chainNote: 'triple',
       isOrphan: false,
@@ -954,6 +958,8 @@ const getRequiredApproversForChangeDelete = async (txn, book, requesterId) => {
         const adminIds = admins.map(a => a.userId).filter(id => id !== requesterId);
         if (adminIds.length > 0) {
           return adminIds;
+        } else if (admins.length > 0) {
+          return [requesterId];
         }
       }
     }
@@ -1176,8 +1182,8 @@ const finalizeCounterpartLegsOnEditApprove = async (tx, txn, book, approveHistor
       data: syncFields
     });
 
-    const newDelta = source.type === 'expense' ? -source.amount : source.amount;
-    const balanceFix = newDelta - oldDelta;
+    const newDelta = source.type === 'expense' ? source.amount : -source.amount;
+    const balanceFix = newDelta;
     if (balanceFix !== 0) {
       await tx.book.update({
         where: { id: leg.bookId },
@@ -4360,7 +4366,8 @@ app.delete('/api/transactions/:id/permanent', authenticateToken, async (req, res
 
     await prisma.$transaction(async (tx) => {
       // Only reverse balance if transaction was NOT rejected (rejection already reversed it)
-      const alreadyReversed = txn.status === 'rejected' || txn.status === 'delete_rejected';
+      // Also, if it has a pendingAction (edit/delete), it was already reversed when the request was made.
+      const alreadyReversed = txn.status === 'rejected' || txn.status === 'delete_rejected' || !!txn.pendingAction;
       if (!alreadyReversed) {
         const balanceAdj = txn.type === 'expense' ? txn.amount : -txn.amount;
         await tx.book.update({
@@ -4373,7 +4380,7 @@ app.delete('/api/transactions/:id/permanent', authenticateToken, async (req, res
       if (txn.linkedTransactionId) {
         const linked = await tx.transaction.findUnique({ where: { id: txn.linkedTransactionId } });
         if (linked) {
-          const linkedAlreadyReversed = linked.status === 'rejected' || linked.status === 'delete_rejected';
+          const linkedAlreadyReversed = linked.status === 'rejected' || linked.status === 'delete_rejected' || !!linked.pendingAction;
           if (!linkedAlreadyReversed) {
             const linkedBalanceAdj = linked.type === 'income' ? -linked.amount : linked.amount;
             await tx.book.update({
