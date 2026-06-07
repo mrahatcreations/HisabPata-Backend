@@ -2742,6 +2742,7 @@ app.post('/api/transactions', authenticateToken, async (req, res) => {
 
 // --- EDIT TRANSACTION ---
 app.put('/api/transactions/:id', authenticateToken, async (req, res) => {
+  console.log(`[DEBUG] 1. Entering edit route for txnId: ${req.params.id}`);
   try {
     const { amount, type, note, category, contact, recipientUserId, recipientOrgId, imageUrl, orgFundId, dateTime: clientDateTime } = req.body;
     const txnId = req.params.id;
@@ -2843,7 +2844,9 @@ app.put('/api/transactions/:id', authenticateToken, async (req, res) => {
 
     const user = await prisma.user.findUnique({ where: { id: req.user.id }, select: { name: true } });
     let mustApprove = await mustUseChangeDeleteApprovalFlow(txn, book, req.user.id);
+    console.log(`[DEBUG] 2. Result of mustUseChangeDeleteApprovalFlow: ${mustApprove}`);
     const requiredApprovers = await getRequiredApproversForChangeDelete(txn, book, req.user.id);
+    console.log(`[DEBUG] 3. Result of getRequiredApproversForChangeDelete:`, requiredApprovers);
     if (mustApprove && requiredApprovers.length === 0) {
       // Orphan: counterparty no longer exists — allow direct edit without approval
       mustApprove = false;
@@ -2914,6 +2917,7 @@ app.put('/api/transactions/:id', authenticateToken, async (req, res) => {
       return res.json({ transaction: enriched, message: 'Transaction updated' });
     } else {
       // Pending edit request flow — balance must be read inside transaction
+      console.log(`[DEBUG] 4. Before buildChangeDeletePendingData()`);
       const pendingData = await buildChangeDeletePendingData(txn, book, req.user.id, {
         oldAmount: txn.amount,
         oldType: txn.type,
@@ -2926,6 +2930,7 @@ app.put('/api/transactions/:id', authenticateToken, async (req, res) => {
         newNote: changes.note !== undefined ? changes.note : txn.note,
         newCategory: changes.category !== undefined ? changes.category : txn.category,
       });
+      console.log(`[DEBUG] 5. After buildChangeDeletePendingData()`);
 
       let updated;
       try {
@@ -2939,6 +2944,7 @@ app.put('/api/transactions/:id', authenticateToken, async (req, res) => {
           preTxnBalance -= txn.amount;
         }
 
+        console.log(`[DEBUG] 6. Before prisma.transaction.update()`);
         const updatedTxn = await prisma.transaction.update({
           where: { id: txnId },
           data: {
@@ -2958,6 +2964,7 @@ app.put('/api/transactions/:id', authenticateToken, async (req, res) => {
             ],
           },
         });
+        console.log(`[DEBUG] 7. After prisma.transaction.update()`);
 
         await prisma.book.update({
           where: { id: book.id },
@@ -2969,6 +2976,7 @@ app.put('/api/transactions/:id', authenticateToken, async (req, res) => {
         if (changes.note !== undefined) linkedChanges.note = changes.note;
         if (changes.category !== undefined) linkedChanges.category = changes.category;
 
+        console.log(`[DEBUG] 8. Before syncCounterpartLegsForChangeDelete()`);
         await syncCounterpartLegsForChangeDelete(prisma, txn, book, {
           pendingAction: 'edit',
           pendingData,
@@ -2982,11 +2990,12 @@ app.put('/api/transactions/:id', authenticateToken, async (req, res) => {
           },
           reverseBalanceOnRequest: true
         }, req.user.id);
+        console.log(`[DEBUG] 9. After syncCounterpartLegsForChangeDelete()`);
 
         return updatedTxn;
       });
       } catch (err) {
-        console.error('Error during pending edit transaction sync:', err);
+        console.error('[DEBUG] 10. Error during pending edit transaction sync. Stack:', err.stack || err);
         return res.status(500).json({ error: 'Failed to process pending edit. Internal error.' });
       }
 
@@ -3002,7 +3011,7 @@ app.put('/api/transactions/:id', authenticateToken, async (req, res) => {
       });
     }
   } catch (error) {
-    console.error('Edit transaction error:', error);
+    console.error('[DEBUG] 10. Edit transaction outer catch block error. Stack:', error.stack || error);
     res.status(500).json({ error: 'Server error editing transaction' });
   }
 });
