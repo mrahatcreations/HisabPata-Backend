@@ -3634,14 +3634,11 @@ app.post('/api/transactions/:id/action', authenticateToken, async (req, res) => 
           }
 
           await prisma.$transaction(async (tx) => {
-            const adj = reverseTxnBalanceForRemoval(txn);
-            if (adj !== 0) {
-              await tx.book.update({
-                where: { id: txn.bookId },
-                data: { balance: { increment: adj } }
-              });
+            // Balance already reversed when pending delete was created — just delete entries
+            const legs = await getCounterpartLegsForChangeDelete(txn, txnBook, tx);
+            for (const leg of legs) {
+              await tx.transaction.delete({ where: { id: leg.id } });
             }
-            await deleteCounterpartLegsForChangeDelete(tx, txn, txnBook);
             await tx.transaction.delete({ where: { id: txnId } });
           });
           broadcast({ type: "data_changed" });
