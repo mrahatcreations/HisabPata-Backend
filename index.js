@@ -2072,7 +2072,7 @@ app.get('/api/org/members', authenticateToken, async (req, res) => {
 // Update Profile
 app.post('/api/onboarding/complete', authenticateToken, async (req, res) => {
   try {
-    const { name, avatarUrl } = req.body;
+    const { name, avatarUrl, email, phoneNumber } = req.body;
     if (!name) {
       return res.status(400).json({ error: 'Name is required' });
     }
@@ -2080,6 +2080,12 @@ app.post('/api/onboarding/complete', authenticateToken, async (req, res) => {
     const updateData = { name };
     if (avatarUrl !== undefined) {
       updateData.avatarUrl = avatarUrl;
+    }
+    if (email !== undefined) {
+      updateData.email = email || null;
+    }
+    if (phoneNumber !== undefined) {
+      updateData.phoneNumber = phoneNumber || null;
     }
 
     const updatedUser = await prisma.user.update({
@@ -2731,7 +2737,7 @@ app.post('/api/transactions', authenticateToken, async (req, res) => {
 // --- EDIT TRANSACTION ---
 app.put('/api/transactions/:id', authenticateToken, async (req, res) => {
   try {
-    const { amount, type, note, category, contact, recipientUserId, imageUrl, orgFundId, dateTime: clientDateTime } = req.body;
+    const { amount, type, note, category, contact, recipientUserId, recipientOrgId, imageUrl, orgFundId, dateTime: clientDateTime } = req.body;
     const txnId = req.params.id;
 
     const txn = await prisma.transaction.findUnique({ where: { id: txnId } });
@@ -2797,6 +2803,7 @@ app.put('/api/transactions/:id', authenticateToken, async (req, res) => {
     if (category !== undefined) changes.category = category;
     if (contact !== undefined) changes.contact = contact;
     if (recipientUserId !== undefined) changes.recipientUserId = recipientUserId;
+    if (recipientOrgId !== undefined) changes.recipientOrgId = recipientOrgId;
     if (imageUrl !== undefined) changes.imageUrl = imageUrl;
     if (orgFundId !== undefined) {
       if (orgFundId === null || orgFundId === '') {
@@ -6702,7 +6709,7 @@ app.post('/api/ai/execute', authenticateToken, async (req, res) => {
     }
 
     if (action === 'create_transaction') {
-      const { bookId, type, amount, category, note, description, dateTime, contact, recipientUserId, orgFundId, audioNoteId } = data;
+      const { bookId, type, amount, category, note, description, dateTime, contact, recipientUserId, recipientOrgId, orgFundId, audioNoteId } = data;
       const resolvedNote = (note || description || '').trim();
 
       if (!bookId || !type || !amount) {
@@ -6742,8 +6749,8 @@ app.post('/api/ai/execute', authenticateToken, async (req, res) => {
         ? book.balance + parsedAmount
         : book.balance - parsedAmount;
 
-      // Handle Send type (expense to another user)
-      const isSend = type === 'expense' && recipientUserId;
+      // Handle Send type (expense to another user or org)
+      const isSend = type === 'expense' && (recipientUserId || recipientOrgId);
 
       const txnData = {
         bookId: book.id,
@@ -6753,6 +6760,7 @@ app.post('/api/ai/execute', authenticateToken, async (req, res) => {
         note: resolvedNote,
         contact: contact || null,
         recipientUserId: recipientUserId || null,
+        recipientOrgId: recipientOrgId || null,
         orgFundId: orgFundId || null,
         dateTime: dateTime ? new Date(dateTime) : new Date(),
         status: isSend ? 'pending' : 'approved',
