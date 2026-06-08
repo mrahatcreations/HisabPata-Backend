@@ -609,6 +609,30 @@ const applyTxnBalanceForAddition = (txn) => {
   return 0;
 };
 
+// Recalculate book balance from approved transactions (income - expense)
+const recalculateBookBalance = async (bookId) => {
+  try {
+    const [incomeAgg, expenseAgg] = await Promise.all([
+      prisma.transaction.aggregate({
+        where: { bookId, type: 'income', reconStatus: 'approved' },
+        _sum: { amount: true }
+      }),
+      prisma.transaction.aggregate({
+        where: { bookId, type: 'expense', reconStatus: 'approved' },
+        _sum: { amount: true }
+      })
+    ]);
+    const totalIncome = incomeAgg._sum.amount || 0;
+    const totalExpense = expenseAgg._sum.amount || 0;
+    const calculatedBalance = totalIncome - totalExpense;
+    await prisma.book.update({ where: { id: bookId }, data: { balance: calculatedBalance } });
+    return calculatedBalance;
+  } catch (err) {
+    console.error(`[BALANCE_RECALC_ERROR] bookId=${bookId}:`, err.message);
+    return null;
+  }
+};
+
 // Org book Send expense ↔ personal book Send income
 const resolveOrgDisbursementOrgTxn = async (txn, book) => {
   let resolvedBook = book;
@@ -1892,6 +1916,7 @@ app.post('/api/auth/login', async (req, res) => {
         name: user.name,
         email: user.email,
         phoneNumber: user.phoneNumber,
+        tokenVersion: user.tokenVersion,
       }
     });
   } catch (error) {
@@ -2232,6 +2257,12 @@ app.get('/api/books', authenticateToken, async (req, res) => {
         status: 'active'
       };
     });
+
+    // Recalculate balance from approved transactions for all active books
+    await Promise.all(booksWithRole.map(async (book) => {
+      const calculated = await recalculateBookBalance(book.id);
+      if (calculated !== null) book.balance = calculated;
+    }));
 
     // Include mock pending books for pending memberships so they show in the list with a pending state
     const pendingOrgIds = pendingMemberships.map(m => m.organizationId);
