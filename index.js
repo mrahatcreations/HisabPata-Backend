@@ -1282,7 +1282,7 @@ const finalizeCounterpartLegsOnEditApprove = async (tx, txn, book, approveHistor
   for (const leg of legs) {
     const cur = await tx.transaction.findUnique({
       where: { id: leg.id },
-      select: { version: true, updateHistory: true, amount: true, type: true, bookId: true }
+      select: { version: true, updateHistory: true, amount: true, type: true, bookId: true, pendingData: true }
     });
     if (!cur) continue;
 
@@ -1301,12 +1301,16 @@ const finalizeCounterpartLegsOnEditApprove = async (tx, txn, book, approveHistor
       data: syncFields
     });
 
-    const newDelta = source.type === 'expense' ? source.amount : -source.amount;
-    const balanceFix = newDelta;
-    if (balanceFix !== 0) {
+    // Balance stays effective during pendingAction — only apply the DIFFERENCE
+    const legPd = parsePendingData(cur.pendingData);
+    const legOldAmount = (legPd.oldAmount != null ? Number(legPd.oldAmount) : source.amount);
+    const legDelta = cur.type === 'expense'
+      ? (legOldAmount - source.amount)
+      : (source.amount - legOldAmount);
+    if (legDelta !== 0) {
       await tx.book.update({
         where: { id: leg.bookId },
-        data: { balance: { increment: balanceFix } }
+        data: { balance: { increment: legDelta } }
       });
     }
   }
@@ -1618,7 +1622,7 @@ const approveFundSendOrg = async (tx, txn, approveHistoryEntry) => {
 
   for (const t of [personalTxn, fundOrgTxn, recipientTxn]) {
     if (!t) continue;
-    await updateFundSendTxnStatus(tx, t, 'pending_recipient', approveHistoryEntry, clearCounter);
+    await updateFundSendTxnStatus(tx, t, 'pending', approveHistoryEntry, clearCounter);
   }
   return { final: false };
 };
@@ -1633,7 +1637,7 @@ const approveFundSendRecipient = async (tx, txn, approveHistoryEntry) => {
     personalTxn?.reconStatus === 'pending_org' || fundOrgTxn?.reconStatus === 'pending_org';
 
   if (orgStillPending && recipientTxn) {
-    await updateFundSendTxnStatus(tx, recipientTxn, 'pending_org', approveHistoryEntry, clearCounter);
+    await updateFundSendTxnStatus(tx, recipientTxn, 'pending', approveHistoryEntry, clearCounter);
     return { final: false };
   }
 
@@ -3948,11 +3952,19 @@ app.post('/api/transactions/:id/action', authenticateToken, async (req, res) => 
 
             const updated = await tx.transaction.findUnique({ where: { id: txnId } });
             if (updated) {
-              const delta = applyTxnBalanceForAddition(updated);
-              await tx.book.update({
-                where: { id: txn.bookId },
-                data: { balance: { increment: delta } }
-              });
+              // Balance stays effective during pendingAction. Only apply the DIFFERENCE
+              // between old and new amounts, not the full balance.
+              const pd = parsePendingData(txn.pendingData);
+              const oldAmount = (pd.oldAmount != null ? Number(pd.oldAmount) : updated.amount);
+              const delta = txn.type === 'expense'
+                ? (oldAmount - updated.amount)
+                : (updated.amount - oldAmount);
+              if (delta !== 0) {
+                await tx.book.update({
+                  where: { id: txn.bookId },
+                  data: { balance: { increment: delta } }
+                });
+              }
             }
             await finalizeCounterpartLegsOnEditApprove(tx, txn, txnBook, approveHistoryEntry);
           });
@@ -4047,7 +4059,7 @@ app.post('/api/transactions/:id/action', authenticateToken, async (req, res) => 
 
         const isSend = txn.category === 'Send' && txn.linkedTransactionId;
         if (isSend || (txn.category === 'Send' && (txn.recipientUserId || txn.recipientOrgId))) {
-          const nextStatus = 'pending_recipient';
+          const nextStatus = 'pending';
 
           // Send: advance fund_send chain (parallel org + recipient) or linked pair
           let fundSendOrgResult = null;
