@@ -61,6 +61,8 @@ module.exports = async (ctx) => {
     }
   });
 
+  await prisma.book.update({ where: { id: voucherOrgBook.id }, data: { balance: { decrement: parsedAmount } } });
+
   await maybeMirrorOrgTxnToCreatorPersonal(prisma, {
     orgTxn: txn,
     orgBook: voucherOrgBook,

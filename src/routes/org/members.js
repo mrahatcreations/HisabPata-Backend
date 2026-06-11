@@ -223,7 +223,8 @@ app.post('/api/org/:orgId/members/invite', authenticateToken, async (req, res) =
         userId,
         organizationId: req.params.orgId,
         role: 'member',
-        status: 'pending'
+        status: 'pending',
+        invitedById: req.user.id
       }
     });
 

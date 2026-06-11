@@ -155,11 +155,15 @@ module.exports = function(app) {
           books: o.books,
           members: o.members.map(m => ({ id: m.user.id, name: m.user.name, role: m.role, userId: m.userId, avatarUrl: m.user.avatarUrl })),
         })),
-        pendingOrganizations: pendingOrgs.map(o => ({
-          id: o.id,
-          name: o.name,
-          status: 'pending',
-        })),
+        pendingOrganizations: pendingOrgs.map(o => {
+          const membership = pendingMemberships.find(m => m.organizationId === o.id);
+          return {
+            id: o.id,
+            name: o.name,
+            status: 'pending',
+            invitedById: membership?.invitedById,
+          };
+        }),
       });
     } catch (error) {
       console.error('Profile fetch error:', error);
@@ -192,6 +196,32 @@ module.exports = function(app) {
     } catch (error) {
       console.error('User search error:', error);
       res.status(500).json({ error: 'Server error searching users' });
+    }
+  });
+
+  // Check which phone numbers match registered users
+  app.post('/api/users/check-contacts', authenticateToken, async (req, res) => {
+    try {
+      const { phones } = req.body;
+      if (!Array.isArray(phones) || phones.length === 0) {
+        return res.json({ users: [] });
+      }
+
+      // Filter to max 500 phones to prevent abuse/overload
+      const uniquePhones = [...new Set(phones)].slice(0, 500);
+
+      const users = await prisma.user.findMany({
+        where: {
+          id: { not: req.user.id },
+          phoneNumber: { in: uniquePhones },
+        },
+        select: { id: true, name: true, avatarUrl: true, phoneNumber: true, email: true },
+      });
+
+      res.json({ users });
+    } catch (error) {
+      console.error('Check contacts error:', error);
+      res.status(500).json({ error: 'Server error checking contacts' });
     }
   });
 
@@ -281,6 +311,43 @@ module.exports = function(app) {
     } catch (error) {
       console.error('Onboarding complete error:', error);
       res.status(500).json({ error: 'Server error completing profile' });
+    }
+  });
+
+  // User accepts or rejects an invitation
+  app.post('/api/user/invitations/:orgId/action', authenticateToken, async (req, res) => {
+    try {
+      const { action } = req.body;
+      if (!['approve', 'reject'].includes(action)) {
+        return res.status(400).json({ error: 'Action must be "approve" or "reject"' });
+      }
+
+      const membership = await prisma.organizationMember.findUnique({
+        where: { userId_organizationId: { userId: req.user.id, organizationId: req.params.orgId } },
+        include: { organization: true }
+      });
+
+      if (!membership || membership.status !== 'pending' || !membership.invitedById) {
+        return res.status(404).json({ error: 'Pending invitation not found' });
+      }
+
+      if (action === 'approve') {
+        await prisma.organizationMember.update({
+          where: { id: membership.id },
+          data: { status: 'active' }
+        });
+        const { broadcast } = require('../websocket');
+        broadcast({ type: "data_changed" });
+        return res.json({ message: 'Invitation accepted' });
+      } else {
+        await prisma.organizationMember.delete({ where: { id: membership.id } });
+        const { broadcast } = require('../websocket');
+        broadcast({ type: "data_changed" });
+        return res.json({ message: 'Invitation rejected' });
+      }
+    } catch (error) {
+      console.error('Invitation action error:', error);
+      res.status(500).json({ error: 'Server error processing invitation' });
     }
   });
 };

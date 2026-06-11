@@ -192,19 +192,14 @@ app.put('/api/transactions/:id', authenticateToken, async (req, res) => {
 
       // Balance counts in pending — adjust for amount changes or re-apply on retry
       if (isPendingOrRejectedSend) {
-        if (isPending && changes.amount !== undefined && changes.amount !== txn.amount) {
-          // Pending: balance already applied, adjust for amount difference
+        if (changes.amount !== undefined && changes.amount !== txn.amount) {
+          // Both Pending and Rejected: balance was already applied and never reversed.
+          // Adjust for amount difference only.
           if (txn.type === 'expense') balanceAdjustment = txn.amount - parsedAmount;
           else if (txn.type === 'income') balanceAdjustment = parsedAmount - txn.amount;
-        } else if (isRejected) {
-          // Rejected retry: balance was reversed on reject, re-apply from scratch
-          if (txn.type === 'expense') {
-            balanceAdjustment = -parsedAmount;
-          }
         }
       } else {
         if (
-          txn.reconStatus !== 'rejected' &&
           changes.amount !== undefined &&
           changes.amount !== txn.amount
         ) {
@@ -252,11 +247,67 @@ app.put('/api/transactions/:id', authenticateToken, async (req, res) => {
             }
           }
 
-          // Sync counterpart legs
           const linkedChanges = {};
           if (changes.amount !== undefined) linkedChanges.amount = parsedAmount;
           if (changes.note !== undefined) linkedChanges.note = changes.note;
           if (changes.category !== undefined) linkedChanges.category = changes.category;
+
+          // RECREATE DELETED RECEIVER LEG ON RETRY
+          if (isEditOnRejected && isSend) {
+            let recipientBook = null;
+            if (txn.recipientUserId) {
+              const recipientMembership = await prisma.organizationMember.findFirst({
+                where: { userId: txn.recipientUserId, organization: { isPersonal: true } },
+                include: { organization: { include: { books: { where: { isDefault: true } } } } }
+              });
+              if (recipientMembership && recipientMembership.organization.books.length > 0) {
+                recipientBook = recipientMembership.organization.books[0];
+              }
+            } else if (txn.recipientOrgId) {
+              recipientBook = await prisma.book.findFirst({
+                where: { organizationId: txn.recipientOrgId, isDefault: true }
+              });
+            }
+            
+            if (recipientBook) {
+              const recipientTxn = await prisma.transaction.create({
+                data: {
+                  bookId: recipientBook.id,
+                  amount: parsedAmount,
+                  type: txn.type === 'expense' ? 'income' : 'expense',
+                  note: changes.note !== undefined ? changes.note : txn.note,
+                  category: 'Send',
+                  contact: txn.contact,
+                  recipientUserId: txn.recipientUserId ? req.user.id : null,
+                  recipientOrgId: txn.recipientOrgId ? book.organizationId : null,
+                  orgFundId: txn.orgFundId,
+                  fundType: txn.fundType,
+                  fromLocation: txn.fromLocation,
+                  toLocation: txn.toLocation,
+                  createdById: req.user.id,
+                  reconStatus: 'pending',
+                  imageUrl: txn.imageUrl,
+                  chainId: txn.chainId,
+                  chainType: txn.chainType,
+                  clientRef: txn.clientRef,
+                  linkedTransactionId: updatedTxn.id,
+                  dateTime: txn.dateTime
+                }
+              });
+              
+              await prisma.transaction.update({
+                where: { id: updatedTxn.id },
+                data: { linkedTransactionId: recipientTxn.id }
+              });
+              
+              const balanceAdjustment = recipientTxn.type === 'income' ? parsedAmount : -parsedAmount;
+              await prisma.book.update({
+                where: { id: recipientBook.id },
+                data: { balance: { increment: balanceAdjustment } }
+              });
+            }
+          }
+
           if (Object.keys(linkedChanges).length > 0) {
             const counterpartUpdateData = { ...linkedChanges };
             if (isEditOnRejected) {
@@ -287,7 +338,12 @@ app.put('/api/transactions/:id', authenticateToken, async (req, res) => {
       const enriched = await enrichTxn(updated);
       const recipientId = txn.recipientUserId || updated.recipientUserId;
       if (recipientId && recipientId !== req.user.id) {
-        await createNotification(recipientId, 'EDIT_COMPLETED', 'লেনদেন সম্পাদিত', `${user?.name || 'কেউ'} লেনদেনটি সম্পাদনা করেছেন।`, txnId, book.organizationId);
+        if (isEditOnRejected && isSend) {
+          await createNotification(recipientId, 'SEND_RECEIVED', 'টাকা পাঠানো হয়েছে', `${user?.name || 'কেউ'} পুনরায় ${parsedAmount} টাকা পাঠিয়েছে।`, updated.linkedTransactionId || txnId, book.organizationId);
+          broadcastToUser(recipientId, { type: 'pending_send_received' });
+        } else {
+          await createNotification(recipientId, 'EDIT_COMPLETED', 'লেনদেন সম্পাদিত', `${user?.name || 'কেউ'} লেনদেনটি সম্পাদনা করেছেন।`, txnId, book.organizationId);
+        }
       }
       return res.json({ transaction: enriched, message: isEditOnRejected ? 'Transaction retried with edits' : 'Transaction updated' });
     } else {
@@ -346,14 +402,7 @@ app.put('/api/transactions/:id', authenticateToken, async (req, res) => {
         });
         console.log(`[DEBUG] 7. After prisma.transaction.update()`);
 
-        // For Send transactions: don't reverse balance during pending edit
-        // (existing balance stays effective until edit is finally approved)
-        if (!isSend) {
-          await prisma.book.update({
-            where: { id: book.id },
-            data: { balance: preTxnBalance },
-          });
-        }
+
 
         const linkedChanges = {};
         if (changes.amount !== undefined) linkedChanges.amount = parsedAmount;
@@ -372,7 +421,7 @@ app.put('/api/transactions/:id', authenticateToken, async (req, res) => {
             action: 'edit_request (counterpart)',
             changes: { new: linkedChanges }
           },
-          reverseBalanceOnRequest: !isSend, // Don't reverse balance for Send during pending
+          reverseBalanceOnRequest: false, // Balance stays effective until approved
           keepReconStatus: isSend, // Send stays 'approved', uses pendingAction
         }, req.user.id);
         console.log(`[DEBUG] 9. After syncCounterpartLegsForChangeDelete()`);

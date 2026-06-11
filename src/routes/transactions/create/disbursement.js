@@ -57,9 +57,7 @@ module.exports = async (ctx) => {
       data: { bookId: recipientBook.id, amount: parsedAmount, type: 'income', note: note || '', category: 'Send', contact, recipientUserId: req.user.id, linkedTransactionId: null, fundType: computedFundType, fromLocation, toLocation, createdById: req.user.id, reconStatus: initialStatus, chainId, chainType, dateTime: txnDateTime }
     });
     await prisma.book.update({ where: { id: bookId }, data: { balance: { decrement: parsedAmount } } });
-    if (initialStatus === 'approved') {
-      await prisma.book.update({ where: { id: recipientBook.id }, data: { balance: { increment: parsedAmount } } });
-    }
+    await prisma.book.update({ where: { id: recipientBook.id }, data: { balance: { increment: parsedAmount } } });
     await prisma.transaction.update({ where: { id: sourceTxn.id }, data: { linkedTransactionId: recipientTxn.id } });
     await prisma.transaction.update({ where: { id: recipientTxn.id }, data: { linkedTransactionId: sourceTxn.id } });
     await maybeMirrorOrgTxnToCreatorPersonal(prisma, {

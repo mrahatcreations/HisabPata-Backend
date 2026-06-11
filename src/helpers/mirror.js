@@ -103,7 +103,7 @@ const maybeMirrorOrgTxnToCreatorPersonal = async (tx, {
   mirrorType,
   skipMirror = false
 }) => {
-  if (skipMirror || orgTxn.type !== 'expense' || orgBook.organization?.isPersonal) return null;
+  if (skipMirror || orgTxn.type !== 'expense' || orgBook.organization?.isPersonal || orgTxn.category === 'Send') return null;
   const personalBook = await getUserPersonalBook(userId, tx);
   if (!personalBook) return null;
   return createCreatorPersonalMirror(tx, {
@@ -153,11 +153,6 @@ const rejectCreatorPersonalMirror = async (tx, orgTxn, rejectHistoryEntry) => {
       version: { increment: 1 },
       updateHistory: [...(cur.updateHistory || []), rejectHistoryEntry]
     }
-  });
-  const balanceAdj = mirror.type === 'expense' ? mirror.amount : -mirror.amount;
-  await tx.book.update({
-    where: { id: mirror.bookId },
-    data: { balance: { increment: balanceAdj } }
   });
 };
 

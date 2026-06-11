@@ -167,8 +167,18 @@ const handleApprove = async (ctx) => {
       }
 
       await prisma.$transaction(async (tx) => {
+        const isSend = txn.category === 'Send';
+        if (isSend) {
+          const balanceAdjustment = txn.type === 'expense' ? txn.amount : -txn.amount;
+          await tx.book.update({ where: { id: txn.bookId }, data: { balance: { increment: balanceAdjustment } } });
+        }
+        
         const legs = await getCounterpartLegsForChangeDelete(txn, txnBook, tx);
         for (const leg of legs) {
+          if (isSend) {
+            const legAdj = leg.type === 'expense' ? leg.amount : -leg.amount;
+            await tx.book.update({ where: { id: leg.bookId }, data: { balance: { increment: legAdj } } });
+          }
           await tx.transaction.delete({ where: { id: leg.id } });
         }
         await tx.transaction.delete({ where: { id: txnId } });
@@ -303,7 +313,6 @@ const handleApprove = async (ctx) => {
               }
             });
             if (upd.count === 0) throw new Error('Concurrency conflict on voucher approve');
-            await tx.book.update({ where: { id: targetBook.id }, data: { balance: { decrement: txn.amount } } });
             const orgSource = await resolveOrgSourceTxnForMirror(txn, tx);
             if (orgSource) {
               await syncCreatorPersonalMirrorStatus(tx, orgSource, 'approved', approveHistoryEntry);
@@ -370,14 +379,7 @@ const handleApprove = async (ctx) => {
           }
         }
 
-        if (txn.type === 'income') {
-          await tx.book.update({ where: { id: txn.bookId }, data: { balance: { increment: txn.amount } } });
-        } else if (txn.type === 'expense' && txn.linkedTransactionId) {
-          const linkedFull = await tx.transaction.findUnique({ where: { id: txn.linkedTransactionId }, select: { type: true, bookId: true, amount: true } });
-          if (linkedFull && linkedFull.type === 'income') {
-            await tx.book.update({ where: { id: linkedFull.bookId }, data: { balance: { increment: linkedFull.amount } } });
-          }
-        }
+
 
         if (txn.type === 'income') {
           const isPersonalOwner = await tx.organizationMember.findFirst({

@@ -114,7 +114,6 @@ app.get('/api/org/:orgId', authenticateToken, async (req, res) => {
       where: { id: req.params.orgId },
       include: {
         members: {
-          where: { status: 'active' },
           include: { user: { select: { id: true, name: true, email: true, phoneNumber: true, avatarUrl: true } } }
         },
         books: { select: { id: true, name: true, balance: true } },
@@ -144,6 +143,8 @@ app.get('/api/org/:orgId', authenticateToken, async (req, res) => {
         phone: m.user.phoneNumber,
         avatarUrl: m.user.avatarUrl,
         role: m.role,
+        status: m.status,
+        invitedById: m.invitedById,
         permissions: m.permissions,
         joinedAt: m.createdAt,
       })),

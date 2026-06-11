@@ -64,10 +64,7 @@ const deleteCounterpartLegsForChangeDelete = async (tx, txn, book) => {
   const legs = await getCounterpartLegsForChangeDelete(txn, book, tx);
   for (const leg of legs) {
     let adj = reverseTxnBalanceForRemoval(leg);
-    if (leg.reconStatus === 'rejected') {
-      adj = 0;
-    }
-    if (leg.reconStatus === 'pending' && leg.type === 'income' && leg.category === 'Send') {
+    if (leg.reconStatus === 'rejected' && leg.category !== 'Send') {
       adj = 0;
     }
     if (adj !== 0) {

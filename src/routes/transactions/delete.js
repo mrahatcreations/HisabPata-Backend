@@ -111,18 +111,9 @@ app.delete('/api/transactions/:id', authenticateToken, async (req, res) => {
     const executeHardDelete = async () => {
       await prisma.$transaction(async (prisma) => {
         let balanceAdjustment = reverseTxnBalanceForRemoval(txn);
-        // Pending Send: balance was applied (sender decrement) — reverse only if expense
-        // Rejected Send: balance already reversed on reject — skip
-        if (isSend && isRejected) {
+        if (!isSend && txn.reconStatus === 'rejected') {
           balanceAdjustment = 0;
-        } else if (isSend && isPending && txn.type !== 'expense') {
-          balanceAdjustment = 0;
-        } else if (txn.reconStatus === 'rejected') {
-          balanceAdjustment = 0;
-        } else if (txn.reconStatus === 'pending_org' && txn.orgFundId) {
-          // Book-based voucher: balance was never applied to org book
-          balanceAdjustment = 0;
-        }
+
         if (balanceAdjustment !== 0) {
           await prisma.book.update({ where: { id: book.id }, data: { balance: { increment: balanceAdjustment } } });
         }
@@ -229,9 +220,8 @@ app.delete('/api/transactions/:id/permanent', authenticateToken, async (req, res
     }
 
     await prisma.$transaction(async (tx) => {
-      // Only reverse balance if transaction was NOT rejected (rejection already reversed it)
-      // Also, if it has a pendingAction (edit/delete), it was already reversed when the request was made.
-      const alreadyReversed = txn.reconStatus === 'rejected' || txn.reconStatus === 'delete_rejected' || !!txn.pendingAction;
+      const isSendLocal = txn.category === 'Send';
+      const alreadyReversed = (!isSendLocal && txn.reconStatus === 'rejected') || txn.reconStatus === 'delete_rejected' || !!txn.pendingAction;
       if (!alreadyReversed) {
         const balanceAdj = txn.type === 'expense' ? txn.amount : -txn.amount;
         await tx.book.update({
@@ -244,7 +234,8 @@ app.delete('/api/transactions/:id/permanent', authenticateToken, async (req, res
       if (txn.linkedTransactionId) {
         const linked = await tx.transaction.findUnique({ where: { id: txn.linkedTransactionId } });
         if (linked) {
-          const linkedAlreadyReversed = linked.reconStatus === 'rejected' || linked.reconStatus === 'delete_rejected' || !!linked.pendingAction;
+          const linkedIsSend = linked.category === 'Send';
+          const linkedAlreadyReversed = (!linkedIsSend && linked.reconStatus === 'rejected') || linked.reconStatus === 'delete_rejected' || !!linked.pendingAction;
           if (!linkedAlreadyReversed) {
             const linkedBalanceAdj = linked.type === 'income' ? -linked.amount : linked.amount;
             await tx.book.update({

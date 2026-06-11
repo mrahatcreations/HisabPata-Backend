@@ -6,6 +6,7 @@ const {
 } = require('../../../helpers/index');
 const { handleApprove } = require('./approve');
 const { handleReject } = require('./reject');
+const { handleCancel } = require('./cancel');
 const { handleRejectModification, handleCounterApprove } = require('./counter');
 
 module.exports = function(app, deps) {
@@ -15,8 +16,8 @@ module.exports = function(app, deps) {
     try {
       const { action } = req.body;
 
-      if (!['approve', 'reject', 'counter_approve', 'reject_modification'].includes(action)) {
-        return res.status(400).json({ error: 'Action must be "approve", "reject", "counter_approve", or "reject_modification"' });
+      if (!['approve', 'reject', 'cancel', 'counter_approve', 'reject_modification'].includes(action)) {
+        return res.status(400).json({ error: 'Action must be "approve", "reject", "cancel", "counter_approve", or "reject_modification"' });
       }
 
       const txn = await prisma.transaction.findUnique({ where: { id: req.params.id } });
@@ -85,7 +86,7 @@ module.exports = function(app, deps) {
 
       if (txn.pendingAction && ['edit', 'delete'].includes(txn.pendingAction)) {
         const pendingDataObj = parsePendingData(txn.pendingData);
-        if (pendingDataObj.requestedBy === req.user.id) {
+        if (action !== 'cancel' && pendingDataObj.requestedBy === req.user.id) {
           const dualLeg = pendingDataObj.dualLegSameUser === true;
           if (!dualLeg || txn.id === pendingDataObj.requestedFromTxnId) {
             return res.status(403).json({
@@ -93,12 +94,19 @@ module.exports = function(app, deps) {
             });
           }
         }
-        const required = pendingDataObj.requiredApprovers || [];
-        const orgAnyOf = pendingDataObj.orgApprovalAnyOf || [];
-        if (required.length > 0 || orgAnyOf.length > 0) {
-          const canApprove = required.includes(req.user.id) || orgAnyOf.includes(req.user.id);
-          if (!canApprove) {
-            return res.status(403).json({ error: 'You are not authorized to approve this edit/delete request.' });
+        
+        if (action === 'cancel') {
+          if (pendingDataObj.requestedBy !== req.user.id && !(await hasAdminOrEditorAccess(txnBook.organizationId, req.user.id))) {
+            return res.status(403).json({ error: 'Only the requester or an admin can cancel this request' });
+          }
+        } else {
+          const required = pendingDataObj.requiredApprovers || [];
+          const orgAnyOf = pendingDataObj.orgApprovalAnyOf || [];
+          if (required.length > 0 || orgAnyOf.length > 0) {
+            const canApprove = required.includes(req.user.id) || orgAnyOf.includes(req.user.id);
+            if (!canApprove) {
+              return res.status(403).json({ error: 'You are not authorized to approve this edit/delete request.' });
+            }
           }
         }
       }
@@ -110,6 +118,8 @@ module.exports = function(app, deps) {
           return await handleApprove(ctx);
         case 'reject':
           return await handleReject(ctx);
+        case 'cancel':
+          return await handleCancel(ctx);
         case 'counter_approve':
           return await handleCounterApprove(ctx);
         case 'reject_modification':

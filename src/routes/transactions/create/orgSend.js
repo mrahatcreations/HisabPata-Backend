@@ -61,9 +61,7 @@ module.exports = async (ctx) => {
     });
 
     await prisma.book.update({ where: { id: bookId }, data: { balance: { decrement: parsedAmount } } });
-    if (initialStatus === 'approved') {
-      await prisma.book.update({ where: { id: recipientBook.id }, data: { balance: { increment: parsedAmount } } });
-    }
+    await prisma.book.update({ where: { id: recipientBook.id }, data: { balance: { increment: parsedAmount } } });
     await prisma.transaction.update({ where: { id: sourceTxn.id }, data: { linkedTransactionId: recipientTxn.id } });
     await prisma.transaction.update({ where: { id: recipientTxn.id }, data: { linkedTransactionId: sourceTxn.id } });
     return sourceTxn;

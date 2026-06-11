@@ -82,6 +82,7 @@ model OrganizationMember {
   organizationId String
   role           String       @default("member")
   status         String       @default("pending")
+  invitedById    String?
   permissions    String[]
   user           User         @relation(fields: [userId], references: [id], onDelete: Cascade)
   organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)

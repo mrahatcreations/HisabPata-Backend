@@ -42,17 +42,21 @@ module.exports = function(app, { authenticateToken, recalculateBookBalance }) {
         select: { id: true, name: true, imageUrl: true, isPersonal: true }
       }) : [];
 
-      const pendingBooks = pendingOrgs.map(org => ({
-        id: `pending_${org.id}`,
-        name: org.name,
-        organizationId: org.id,
-        organization: { id: org.id, name: org.name, isPersonal: org.isPersonal, imageUrl: org.imageUrl },
-        role: 'member',
-        permissions: [],
-        balance: 0.0,
-        isDefault: false,
-        status: 'pending'
-      }));
+      const pendingBooks = pendingOrgs.map(org => {
+        const membership = pendingMemberships.find(m => m.organizationId === org.id);
+        return {
+          id: `pending_${org.id}`,
+          name: org.name,
+          organizationId: org.id,
+          organization: { id: org.id, name: org.name, isPersonal: org.isPersonal, imageUrl: org.imageUrl },
+          role: 'member',
+          permissions: [],
+          balance: 0.0,
+          isDefault: false,
+          status: 'pending',
+          invitedById: membership?.invitedById
+        };
+      });
 
       res.json([...booksWithRole, ...pendingBooks]);
     } catch (error) {

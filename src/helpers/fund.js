@@ -37,29 +37,32 @@ const rejectFundSendChain = async (tx, txn, rejectHistoryEntry) => {
   if (!chain) return false;
   for (const ct of chain) {
     if (ct.reconStatus === 'rejected') continue;
-    const cur = await tx.transaction.findUnique({
-      where: { id: ct.id },
-      select: { version: true, updateHistory: true }
-    });
-    if (!cur) throw new Error('Chain transaction not found');
-    const upd = await tx.transaction.updateMany({
-      where: { id: ct.id, version: cur.version },
-      data: {
-        reconStatus: 'rejected',
-        pendingAction: null,
-        pendingData: null,
-        counterProposedAmount: null,
-        counterProposedBy: null,
-        version: { increment: 1 },
-        updateHistory: [...(cur.updateHistory || []), rejectHistoryEntry]
-      }
-    });
-    if (upd.count === 0) throw new Error('Concurrency conflict on fund_send reject');
-    if (ct.type === 'expense') {
+    if (ct.type === 'income') {
       await tx.book.update({
         where: { id: ct.bookId },
-        data: { balance: { increment: ct.amount } }
+        data: { balance: { decrement: ct.amount } }
       });
+      await tx.transaction.delete({ where: { id: ct.id } });
+    } else {
+      const cur = await tx.transaction.findUnique({
+        where: { id: ct.id },
+        select: { version: true, updateHistory: true }
+      });
+      if (!cur) throw new Error('Chain transaction not found');
+      const upd = await tx.transaction.updateMany({
+        where: { id: ct.id, version: cur.version },
+        data: {
+          reconStatus: 'rejected',
+          pendingAction: null,
+          pendingData: null,
+          counterProposedAmount: null,
+          counterProposedBy: null,
+          linkedTransactionId: null,
+          version: { increment: 1 },
+          updateHistory: [...(cur.updateHistory || []), rejectHistoryEntry]
+        }
+      });
+      if (upd.count === 0) throw new Error('Concurrency conflict on fund_send reject');
     }
   }
   return true;
@@ -103,12 +106,6 @@ const approveFundSendOrg = async (tx, txn, approveHistoryEntry) => {
     for (const t of chain) {
       await updateFundSendTxnStatus(tx, t, 'approved', approveHistoryEntry, clearCounter);
     }
-    if (recipientTxn && !recipientTxn.isLiability) {
-      await tx.book.update({
-        where: { id: recipientTxn.bookId },
-        data: { balance: { increment: recipientTxn.amount } }
-      });
-    }
     return { final: true };
   }
 
@@ -135,12 +132,6 @@ const approveFundSendRecipient = async (tx, txn, approveHistoryEntry) => {
 
   for (const t of chain) {
     await updateFundSendTxnStatus(tx, t, 'approved', approveHistoryEntry, clearCounter);
-  }
-  if (recipientTxn && !recipientTxn.isLiability) {
-    await tx.book.update({
-      where: { id: recipientTxn.bookId },
-      data: { balance: { increment: recipientTxn.amount } }
-    });
   }
   return { final: true };
 };
