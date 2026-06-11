@@ -113,7 +113,10 @@ app.get('/api/org/:orgId', authenticateToken, async (req, res) => {
     const org = await prisma.organization.findUnique({
       where: { id: req.params.orgId },
       include: {
-        members: { include: { user: { select: { id: true, name: true, email: true, phoneNumber: true, avatarUrl: true } } } },
+        members: {
+          where: { status: 'active' },
+          include: { user: { select: { id: true, name: true, email: true, phoneNumber: true, avatarUrl: true } } }
+        },
         books: { select: { id: true, name: true, balance: true } },
       }
     });

@@ -181,9 +181,10 @@ module.exports = function(app) {
           OR: [
             { name: { contains: q, mode: 'insensitive' } },
             { phoneNumber: { endsWith: q.slice(-10) } },
+            { email: { contains: q, mode: 'insensitive' } },
           ],
         },
-        select: { id: true, name: true, avatarUrl: true },
+        select: { id: true, name: true, avatarUrl: true, phoneNumber: true, email: true },
         take: 20,
       });
 

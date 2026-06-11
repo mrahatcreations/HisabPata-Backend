@@ -192,6 +192,52 @@ app.post('/api/org/:orgId/members/:memberId/action', authenticateToken, async (r
   }
 });
 
+app.post('/api/org/:orgId/members/invite', authenticateToken, async (req, res) => {
+  try {
+    const { userId } = req.body;
+    if (!userId) {
+      return res.status(400).json({ error: 'userId is required' });
+    }
+
+    const targetUser = await prisma.user.findUnique({ where: { id: userId } });
+    if (!targetUser) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    const callerMembership = await prisma.organizationMember.findUnique({
+      where: { userId_organizationId: { userId: req.user.id, organizationId: req.params.orgId } }
+    });
+    if (!callerMembership || callerMembership.status !== 'active') {
+      return res.status(403).json({ error: 'Not an active member of this organization' });
+    }
+
+    const existing = await prisma.organizationMember.findUnique({
+      where: { userId_organizationId: { userId, organizationId: req.params.orgId } }
+    });
+    if (existing) {
+      return res.status(400).json({ error: 'User is already a member or has a pending invitation' });
+    }
+
+    const membership = await prisma.organizationMember.create({
+      data: {
+        userId,
+        organizationId: req.params.orgId,
+        role: 'member',
+        status: 'pending'
+      }
+    });
+
+    const org = await prisma.organization.findUnique({ where: { id: req.params.orgId }, select: { name: true } });
+    await createNotification(userId, 'MEMBERSHIP_REQUESTED', 'সদস্যপদের আমন্ত্রণ', `আপনাকে ${org?.name || 'একটি সংগঠনে'} যোগ দেওয়ার জন্য আমন্ত্রণ জানানো হয়েছে।`, null, req.params.orgId);
+
+    broadcast({ type: "data_changed" });
+    res.json({ message: 'Invitation sent', membership });
+  } catch (error) {
+    console.error('Invite member error:', error);
+    res.status(500).json({ error: 'Server error inviting member' });
+  }
+});
+
 app.delete('/api/org/:orgId/members/:memberId', authenticateToken, async (req, res) => {
   try {
     const callerMembership = await prisma.organizationMember.findUnique({
