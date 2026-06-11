@@ -64,10 +64,7 @@ const createCreatorPersonalMirror = async (tx, {
   if (!creatorPersonalBook || creatorPersonalBook.id === orgBook.id) return null;
 
   const type = mirrorType || orgTxn.type;
-  const orgLabel = orgBook.name || 'org';
-  const note = type === 'income'
-    ? (orgTxn.note ? `${orgTxn.note} [${orgLabel}]` : `[${orgLabel}]`)
-    : (orgTxn.note ? `${orgTxn.note} [${orgLabel}]` : `[${orgLabel}]`);
+  const note = orgTxn.note || '';
 
   const mirror = await tx.transaction.create({
     data: {
