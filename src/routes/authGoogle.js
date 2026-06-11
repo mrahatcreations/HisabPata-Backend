@@ -1,8 +1,8 @@
 const { OAuth2Client } = require('google-auth-library');
 const jwt = require('jsonwebtoken');
 const { prisma } = require('../config/database');
+const { DEFAULT_CATEGORIES } = require('../config/constants');
 
-const DEFAULT_CATEGORIES = ['Food', 'Transport', 'Shopping', 'Bills', 'Health', 'Education', 'Entertainment', 'Salary', 'Others'];
 const client = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
 
 module.exports = function(app) {
