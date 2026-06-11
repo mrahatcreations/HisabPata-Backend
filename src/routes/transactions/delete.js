@@ -113,6 +113,7 @@ app.delete('/api/transactions/:id', authenticateToken, async (req, res) => {
         let balanceAdjustment = reverseTxnBalanceForRemoval(txn);
         if (!isSend && txn.reconStatus === 'rejected') {
           balanceAdjustment = 0;
+        }
 
         if (balanceAdjustment !== 0) {
           await prisma.book.update({ where: { id: book.id }, data: { balance: { increment: balanceAdjustment } } });
