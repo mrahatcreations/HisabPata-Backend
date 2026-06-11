@@ -91,6 +91,7 @@ app.use((req, res, next) => {
 });
 
 require('./routes/auth')(app);
+require('./routes/authGoogle')(app);
 require('./routes/org')(app);
 require('./routes/user')(app);
 require('./routes/ai')(app);

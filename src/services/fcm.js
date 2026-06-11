@@ -5,7 +5,7 @@ let initialized = false;
 
 function initFcm() {
   if (initialized) return true;
-  const serviceAccountPath = process.env.FCM_SERVICE_ACCOUNT_PATH;
+  const serviceAccountPath = process.env.FCM_SERVICE_ACCOUNT_PATH || '../config/firebase-adminsdk.json';
   if (!serviceAccountPath) {
     console.warn('[FCM] FCM_SERVICE_ACCOUNT_PATH not set. Push notifications disabled.');
     return false;
