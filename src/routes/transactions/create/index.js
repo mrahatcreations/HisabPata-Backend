@@ -8,7 +8,7 @@ const voucher = require('./voucher');
 const normal = require('./normal');
 
 module.exports = function(app, deps) {
-  const { authenticateToken } = deps;
+  const { authenticateToken, parseClientDateTime } = deps;
 
   app.post('/api/transactions', authenticateToken, async (req, res) => {
     try {
