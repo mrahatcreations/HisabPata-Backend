@@ -4,7 +4,7 @@ const { enrichTxn } = require('../../../helpers/enrichTxn');
 
 module.exports = async (ctx) => {
   const { book, parsedAmount, txnClientRef, txnDateTime, computedFundType, deps, req, res } = ctx;
-  const { checkApprovalBypass, hasAdminOrEditorAccess, checkPermission, createNotification, getOrgAdminUserIds, maybeMirrorOrgTxnToCreatorPersonal } = deps;
+  const { checkApprovalBypass, hasAdminOrEditorAccess, checkPermission, createNotification, getOrgAdminUserIds } = deps;
   const { note, contact, fromLocation, toLocation, imageUrl, recipientOrgId, bookId } = req.body;
 
   const recipientBook = await prisma.book.findFirst({
@@ -66,12 +66,6 @@ module.exports = async (ctx) => {
     }
     await prisma.transaction.update({ where: { id: sourceTxn.id }, data: { linkedTransactionId: recipientTxn.id } });
     await prisma.transaction.update({ where: { id: recipientTxn.id }, data: { linkedTransactionId: sourceTxn.id } });
-    await maybeMirrorOrgTxnToCreatorPersonal(prisma, {
-      orgTxn: sourceTxn,
-      orgBook: book,
-      userId: req.user.id,
-      txnClientRef
-    });
     return sourceTxn;
   });
 

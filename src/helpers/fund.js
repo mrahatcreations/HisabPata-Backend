@@ -55,11 +55,10 @@ const rejectFundSendChain = async (tx, txn, rejectHistoryEntry) => {
       }
     });
     if (upd.count === 0) throw new Error('Concurrency conflict on fund_send reject');
-    if (ct.reconStatus === 'approved') {
-      const balanceAdj = ct.type === 'expense' ? ct.amount : -ct.amount;
+    if (ct.type === 'expense') {
       await tx.book.update({
         where: { id: ct.bookId },
-        data: { balance: { increment: balanceAdj } }
+        data: { balance: { increment: ct.amount } }
       });
     }
   }
