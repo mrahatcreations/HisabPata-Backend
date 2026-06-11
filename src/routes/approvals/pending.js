@@ -1,6 +1,6 @@
 const { prisma } = require('../../config/database');
 
-module.exports = function(app, { authenticateToken, hasAdminOrEditorAccess, checkPermission, createNotification, getOrgAdminUserIds, resolveApprovalOrgId, parsePendingData }) {
+module.exports = function(app, { authenticateToken, hasAdminOrEditorAccess, checkPermission, createNotification, getOrgAdminUserIds, resolveApprovalOrgId, parsePendingData, buildChangeDeleteNotification }) {
 
 app.get('/api/approvals/pending', authenticateToken, async (req, res) => {
   try {
