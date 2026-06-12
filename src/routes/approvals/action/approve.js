@@ -46,7 +46,7 @@ const handleApprove = async (ctx) => {
   }
 
   // 2. Check if this is a pending creation step and the caller is NOT the recipient.
-  if (txn.reconStatus === 'pending' || txn.reconStatus === 'pending_recipient') {
+  if (!txn.pendingAction && (txn.reconStatus === 'pending' || txn.reconStatus === 'pending_recipient')) {
     let recipientUserId = null;
     let recipientOrgId = null;
     if (txn.type === 'expense' && txn.category === 'Send') {
