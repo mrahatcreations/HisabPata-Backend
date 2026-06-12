@@ -89,7 +89,7 @@ const getLastUserMessage = (messages) => {
 };
 
 const resolveAiTransactionNote = ({ note, description, amount, previewNotes, lastUserMessage, category }) => {
-  const direct = (note || description || '').trim();
+  const direct = (description || note || '').trim();
   if (direct) return direct;
 
   const parsedAmount = parseFloat(amount);

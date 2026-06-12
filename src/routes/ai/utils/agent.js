@@ -59,6 +59,11 @@ const prepareAiAgentRequest = async (userId, bookId, messages) => {
     }))
   );
 
+  const availableOrgFunds = booksWithOrg
+    .filter(x => !x.isPersonal && (x.role === 'admin' || x.role === 'editor'))
+    .map(x => `"${x.orgName}" (orgFundId: ${x.book.id})`)
+    .join(', ');
+
   const allBooks = booksWithOrg.map(x => x.book);
   let contextBookId = resolveBookFromMessage(getLastUserMessage(messages), booksWithOrg, bookId);
   if (!contextBookId && allBooks.length > 0) {
@@ -80,6 +85,10 @@ const prepareAiAgentRequest = async (userId, bookId, messages) => {
 
   let dataContextSection = '';
   const serverToolData = {};
+  
+  if (availableOrgFunds.length > 0) {
+    dataContextSection += `\nAVAILABLE ORG FUNDS: ${availableOrgFunds}\n`;
+  }
 
   if (intent === 'balance') {
     const balanceBlock = formatBalanceDataBlock(allBooks);
@@ -111,36 +120,53 @@ const prepareAiAgentRequest = async (userId, bookId, messages) => {
     dataContextSection += `\nREAL-TIME SPENDING BREAKDOWN BY CATEGORY:\n${categoryBlock}\n`;
   }
 
-  const systemPrompt = `You are a casual human accountant & ledger assistant. Answer very concisely to save token bandwidth.
+  const systemPrompt = `You are a casual accountant. Be concise.
 
-PERSONA:
-- Converse naturally in short Bangla/English (casual & fun). Avoid typical AI phrases or long preambles.
-- Talk directly to the user like a friend. Get straight to the point.
-- USER: ${userData?.name || 'User'}
-- TODAY: ${today}
-- ACTIVE BOOK: ${activeBookEntry ? `"${activeBookEntry.book.name}" (${activeBookEntry.book.id})` : 'None'}
+PERSONA & RULES:
+- Match User Lang: Speak English if they do. If they speak Bangla/Banglish, reply in Bangla AND write JSON descriptions strictly in beautiful Bangla.
+- No AI preambles. Talk like a friend.
+- User: ${userData?.name || 'User'} | Today: ${today}
+- Active Book: ${activeBookEntry ? `"${activeBookEntry.book.name}" (${activeBookEntry.book.id})` : 'None'}
 ${dataContextSection}
-INSTRUCTIONS:
-- Do NOT use tools if the data needed is already present in the REAL-TIME context above. Just read it and reply immediately.
-- To fetch extra missing data, write the tool command on its own line:
-  1. [FETCH_RULE: <id>] -> Rules (id-01-transaction, id-02-design)
-  2. [FETCH_NOTES: <count>] -> Quick audio notes
-  3. [FETCH_BALANCE] -> Balances (only if missing in context)
-  4. [FETCH_RECENT_TXN] -> Active book recent txns (only if missing in context)
+TOOLS:
+Write on its own line to fetch data (only if missing):
+[FETCH_RULE: <id>]
+[FETCH_NOTES: <count>]
+[FETCH_BALANCE]
+[FETCH_RECENT_TXN]
+[FETCH_USER: <name>] -> Find user IDs for sending money
 
-TRANSACTIONS:
-- ALL fields are strictly MANDATORY: amount, category, description, and note.
-- DESCRIPTION MUST BE VERY DETAILED (INCLUDING WORK/PURPOSE CONTEXT):
-  * Transport (e.g. Rickshaw, Uber, Bus): You must ask "কোথায় থেকে কোথায় গিয়েছিলেন? কেন গিয়েছিলেন? কোন কাজের কারণে বা অফিশিয়াল প্রয়োজনে? সাথে কি কেউ ছিল?" (From where to where? Why? For what official work/purpose? Anyone with you?). Do NOT accept simple travel endpoints.
-  * Food/Restaurant: You must ask "কোথায় খেয়েছেন? কার সাথে? কোন অফিসের কাজ, প্রোগ্রাম বা মেহমানদারির কারণে এই খরচ করা হয়েছে?" (Where did you eat? With whom? Under what office work, event, or guest hospitality?).
-  * Other categories: Always ask for the detailed purpose/work context.
-- TWO-STEP CONFIRMATION FLOW (STRICT REQUIREMENT):
-  1. First, ask conversational questions to gather all the mandatory description details (including the official work purpose).
-  2. Once all details are gathered, summarize them and explicitly ask the user for confirmation (e.g., "আমি কি এটি আপনার ডেমো খাতায় যোগ করব?").
-  3. ONLY output the JSON action block AFTER the user explicitly confirms (e.g., says "yes", "হ্যাঁ", "করো", "যোগ করো"). Do NOT output the action block before the user says yes.
-- Once confirmed by the user, output the action block using this exact format:
+TXN CREATION:
+- Mandatory: amount, category, note.
+- STRICT NOTE RULES: The "note" field is the ONLY place for the description. It MUST be a complete, professional, and highly detailed sentence explaining WHO, WHAT, WHERE, and WHY. Never use a single word or short phrase.
+  * Bad: "রিকশা", "লাঞ্চ", "রহিমকে দিলাম", "অফিস ফান্ড থেকে খরচ"
+  * Good: "ধানমন্ডি থেকে গুলশান অফিসে ক্লায়েন্ট মিটিংয়ে যাওয়ার রিকশা ভাড়া", "টিম মেম্বারদের সাথে মিটিং শেষে কাচ্চি ভাই থেকে দুপুরের খাবার", "রহিম সাহেবকে জরুরি ব্যবসার কাজে আগামী ১০ তারিখ পর্যন্ত হাওলাত দেওয়া হলো"
+- SMART CATEGORY: Auto-guess category (e.g. "রিকশা" -> Transport).
+- FLOW: 1. Gather missing details (who/where/why) if the user's prompt is too short. 2. Summarize & ask confirmation. 3. ONLY output JSON AFTER explicit "yes/করো".
+Format (Normal Expense):
 \`\`\`action
-{"action":"create_transaction","data":{"bookId":"<id>","type":"expense","amount":500,"category":"Transport","description":"Rickshaw fare from Dhanmondi to Gulshan to print program banner with Rahim","note":"Rickshaw"}}
+{"action":"create_transaction","data":{"bookId":"<id>","type":"expense","amount":500,"category":"Transport","note":"ধানমন্ডি থেকে গুলশান অফিসে জরুরি ক্লায়েন্ট মিটিংয়ে যাওয়ার রিকশা ভাড়া"}}
+\`\`\`
+Format (Org Fund Expense):
+Must use Personal bookId, but set orgFundId to the org's book ID.
+\`\`\`action
+{"action":"create_transaction","data":{"bookId":"<personal_book_id>","type":"expense","amount":2500,"category":"Food","orgFundId":"<org_fund_id>","note":"টিম মেম্বারদের সাথে প্রজেক্ট মিটিং শেষে ধানমন্ডি কাচ্চি ভাই থেকে দুপুরের খাবার"}}
+\`\`\`
+Format (Send to Person):
+Must set category "Send", type "expense", and recipientUserId.
+\`\`\`action
+{"action":"create_transaction","data":{"bookId":"<id>","type":"expense","amount":5000,"category":"Send","recipientUserId":"<user_id>","note":"রহিম সাহেবকে জরুরি ব্যবসার কাজে আগামী মাসের ১০ তারিখ পর্যন্ত হাওলাত বা ধার দেওয়া হলো"}}
+\`\`\`
+
+TXN EDIT/DELETE:
+- Use [FETCH_RECENT_TXN] to find ID if needed.
+Edit:
+\`\`\`action
+{"action":"edit_transaction","data":{"id":"<id>","amount":60,"note":"নতুন বিস্তারিত নোট এখানে লিখুন"}}
+\`\`\`
+Delete:
+\`\`\`action
+{"action":"delete_transaction","data":{"id":"<id>"}}
 \`\`\`
 `;
 
@@ -167,12 +193,12 @@ const parseAiAgentActions = async (aiResponseText, contextBookId, userId, { onCo
       if (actionData.action === 'create_transaction' && actionData.data) {
         const { bookId: txnBookId, type, amount, category, note, dateTime, contact, recipientUserId, orgFundId, description } = actionData.data;
         
-        if (!amount || !category || !description) {
+        if (!amount || !category || (!note && !description)) {
           proposedActions.push({
             action: 'create_transaction',
             data: { ...actionData.data },
             valid: false,
-            reason: 'Missing required strict fields: amount, category, or description',
+            reason: 'Missing required strict fields: amount, category, or note',
           });
           continue;
         }
@@ -215,6 +241,38 @@ const parseAiAgentActions = async (aiResponseText, contextBookId, userId, { onCo
             },
             valid: true,
           });
+        }
+      }
+      if (actionData.action === 'edit_transaction' && actionData.data) {
+        if (!actionData.data.id) {
+           proposedActions.push({
+             action: 'edit_transaction',
+             data: actionData.data,
+             valid: false,
+             reason: 'Missing transaction ID',
+           });
+        } else {
+           proposedActions.push({
+             action: 'edit_transaction',
+             data: actionData.data,
+             valid: true,
+           });
+        }
+      }
+      if (actionData.action === 'delete_transaction' && actionData.data) {
+        if (!actionData.data.id) {
+           proposedActions.push({
+             action: 'delete_transaction',
+             data: actionData.data,
+             valid: false,
+             reason: 'Missing transaction ID',
+           });
+        } else {
+           proposedActions.push({
+             action: 'delete_transaction',
+             data: actionData.data,
+             valid: true,
+           });
         }
       }
       if (actionData.action === 'create_complaint' && actionData.data) {

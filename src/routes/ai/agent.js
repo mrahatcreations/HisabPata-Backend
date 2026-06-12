@@ -149,6 +149,20 @@ app.post('/api/ai/agent/tool', authenticateToken, async (req, res) => {
         category: t.category,
       }));
       return res.json({ result: formatTransactionsDataBlock(preview) });
+    } else if (toolName === 'FETCH_USER') {
+      const { id: name } = args || {};
+      if (!name) return res.json({ result: "No search name provided." });
+      
+      const users = await prisma.user.findMany({
+        where: { name: { contains: name, mode: 'insensitive' } },
+        take: 5,
+        select: { id: true, name: true, phone: true }
+      });
+      
+      if (users.length === 0) return res.json({ result: "No users found matching: " + name });
+      
+      const formatted = users.map(u => `Name: ${u.name}, Phone: ${u.phone || 'N/A'}, userId: ${u.id}`).join('\n');
+      return res.json({ result: `Users found:\n${formatted}` });
     }
     
     return res.json({ result: "Unknown tool call." });
