@@ -95,8 +95,8 @@ const upload = multer({
   storage: storage,
   limits: { fileSize: 100 * 1024 * 1024 },
   fileFilter: (req, file, cb) => {
-    const filetypes = /jpeg|jpg|png|gif|webp|mp4|mov|avi|mkv|quicktime|mp3|m4a|wav|aac|ogg|webm|x-m4a/;
-    const mimetype = filetypes.test(file.mimetype) || file.mimetype.includes('audio/');
+    const filetypes = /jpeg|jpg|png|gif|webp|mp4|mov|avi|mkv|quicktime|mp3|m4a|wav|aac|ogg|webm|x-m4a|pcm/;
+    const mimetype = filetypes.test(file.mimetype) || file.mimetype.includes('audio/') || file.mimetype === 'application/octet-stream';
     const extname = filetypes.test(path.extname(file.originalname).toLowerCase());
 
     if (mimetype || extname) {

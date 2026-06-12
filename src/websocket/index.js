@@ -80,7 +80,7 @@ function handleAsrStream(clientWs, url) {
   }
 
   function forwardAudioChunk(data) {
-    if (closing || !asrWs || asrWs.readyState !== WebSocket.OPEN) return;
+    if (closing || !asrWs || asrWs.readyState !== 1) return;
     if (Buffer.isBuffer(data)) {
       asrWs.send(data);
     }
