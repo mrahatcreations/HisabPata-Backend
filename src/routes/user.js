@@ -369,6 +369,9 @@ module.exports = function(app) {
         data: { nativeAiStatus: 'pending' },
       });
 
+      const ws = require('../websocket');
+      if (ws.broadcastToUser) ws.broadcastToUser(req.user.id, { type: 'user_updated', user: { id: req.user.id, nativeAiStatus: 'pending' } });
+
       res.json({ message: 'Request submitted successfully', nativeAiStatus: updatedUser.nativeAiStatus });
     } catch (error) {
       console.error('Request AI access error:', error);

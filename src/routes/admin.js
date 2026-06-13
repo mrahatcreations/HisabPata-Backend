@@ -290,6 +290,10 @@ app.put('/api/admin/users/:id', authenticateAdmin, async (req, res) => {
         nativeAiTokensUsedTotal: true, nativeAiTokensUsedToday: true, nativeAiTokensUsedMonth: true
       },
     });
+
+    const ws = require('../websocket');
+    if (ws.broadcastToUser) ws.broadcastToUser(user.id, { type: 'user_updated', user });
+
     res.json(user);
   } catch (error) {
     console.error('[Admin] Failed to update user:', error);
