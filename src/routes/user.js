@@ -104,6 +104,28 @@ module.exports = function(app) {
     }
   });
 
+  app.delete('/api/user/ai-config', authenticateToken, async (req, res) => {
+    try {
+      await prisma.user.update({
+        where: { id: req.user.id },
+        data: { aiConfig: null },
+      });
+
+      const ws = require('../websocket');
+      if (ws.broadcastToUser) {
+        ws.broadcastToUser(req.user.id, {
+          type: 'user_updated',
+          user: { id: req.user.id, aiConfig: null },
+        });
+      }
+
+      res.json({ message: 'AI configuration reset' });
+    } catch (error) {
+      console.error('[AI Config] Delete error:', error);
+      res.status(500).json({ error: 'Server error resetting AI configuration' });
+    }
+  });
+
   // Get Current Profile & State
   app.get('/api/user/profile', authenticateToken, async (req, res) => {
     try {
