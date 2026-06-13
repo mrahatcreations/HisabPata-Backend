@@ -88,6 +88,14 @@ module.exports = function(app) {
         data: { aiConfig: normalized.config },
       });
 
+      const ws = require('../websocket');
+      if (ws.broadcastToUser) {
+        ws.broadcastToUser(req.user.id, {
+          type: 'user_updated',
+          user: { id: req.user.id, aiConfig: normalized.config },
+        });
+      }
+
       const safeConfig = { ...normalized.config, apiKey: normalized.config.apiKey.substring(0, 4) + '...' + normalized.config.apiKey.slice(-4) };
       res.json({ message: 'AI configuration saved', config: safeConfig });
     } catch (error) {
