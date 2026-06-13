@@ -142,6 +142,7 @@ module.exports = function(app) {
           phoneNumber: user.phoneNumber,
           tokenVersion: user.tokenVersion,
           avatarUrl: user.avatarUrl,
+          nativeAiStatus: user.nativeAiStatus,
         },
         organizations: orgs.map(o => ({
           id: o.id,
@@ -348,6 +349,30 @@ module.exports = function(app) {
     } catch (error) {
       console.error('Invitation action error:', error);
       res.status(500).json({ error: 'Server error processing invitation' });
+    }
+  });
+
+  // Request Native AI Access
+  app.post('/api/user/request-ai-access', authenticateToken, async (req, res) => {
+    try {
+      const user = await prisma.user.findUnique({ where: { id: req.user.id } });
+      if (!user) {
+        return res.status(404).json({ error: 'User not found' });
+      }
+
+      if (user.nativeAiStatus === 'approved') {
+        return res.status(400).json({ error: 'AI access is already approved' });
+      }
+
+      const updatedUser = await prisma.user.update({
+        where: { id: req.user.id },
+        data: { nativeAiStatus: 'pending' },
+      });
+
+      res.json({ message: 'Request submitted successfully', nativeAiStatus: updatedUser.nativeAiStatus });
+    } catch (error) {
+      console.error('Request AI access error:', error);
+      res.status(500).json({ error: 'Server error requesting AI access' });
     }
   });
 };

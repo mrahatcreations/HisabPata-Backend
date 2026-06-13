@@ -15,6 +15,37 @@ const {
   saveAiChatTurn,
   getLastUserMessage,
 } = require('./utils');
+const { prisma } = require('../../config/database');
+
+async function checkAndResetUserTokens(user) {
+  if (!user || user.nativeAiStatus !== 'approved') return user;
+  
+  const now = new Date();
+  const lastReset = user.nativeAiLastTokenReset ? new Date(user.nativeAiLastTokenReset) : new Date(0);
+  
+  let resetToday = false;
+  let resetMonth = false;
+
+  if (now.getDate() !== lastReset.getDate() || now.getMonth() !== lastReset.getMonth() || now.getFullYear() !== lastReset.getFullYear()) {
+    resetToday = true;
+  }
+  if (now.getMonth() !== lastReset.getMonth() || now.getFullYear() !== lastReset.getFullYear()) {
+    resetMonth = true;
+  }
+
+  if (resetToday || resetMonth) {
+    const updated = await prisma.user.update({
+      where: { id: user.id },
+      data: {
+        nativeAiTokensUsedToday: resetToday ? 0 : user.nativeAiTokensUsedToday,
+        nativeAiTokensUsedMonth: resetMonth ? 0 : user.nativeAiTokensUsedMonth,
+        nativeAiLastTokenReset: now,
+      }
+    });
+    return updated;
+  }
+  return user;
+}
 
 module.exports = function(app) {
 
@@ -32,13 +63,26 @@ app.post('/api/ai/agent', authenticateToken, async (req, res) => {
       maxTokens: resolved.maxTokens,
     };
 
-    if (!provider || !apiKey || !messages) {
-      return res.status(400).json({ error: 'Missing required fields: provider, apiKey, messages' });
+    if (!provider || !messages) {
+      return res.status(400).json({ error: 'Missing required fields: provider, messages' });
     }
-    if (!model || !String(model).trim()) {
+    if (provider !== 'hisabpata_ai' && !apiKey) {
+      return res.status(400).json({ error: 'Missing required API key' });
+    }
+    if (provider !== 'hisabpata_ai' && (!model || !String(model).trim())) {
       return res.status(400).json({
         error: 'AI model is not selected. Run Find Working Models in AI settings, pick a model, and save.',
       });
+    }
+
+    if (provider === 'hisabpata_ai') {
+      let user = await prisma.user.findUnique({ where: { id: req.user.id } });
+      user = await checkAndResetUserTokens(user);
+      if (user.nativeAiStatus !== 'approved') return res.status(403).json({ error: 'Native AI access not approved' });
+      if (user.nativeAiExpiry && new Date(user.nativeAiExpiry) < new Date()) return res.status(403).json({ error: 'Native AI access expired' });
+      if (user.nativeAiTotalTokenLimit !== null && user.nativeAiTokensUsedTotal >= user.nativeAiTotalTokenLimit) return res.status(403).json({ error: 'Total token limit reached' });
+      if (user.nativeAiDailyTokenLimit !== null && user.nativeAiTokensUsedToday >= user.nativeAiDailyTokenLimit) return res.status(403).json({ error: 'Daily token limit reached' });
+      if (user.nativeAiMonthlyTokenLimit !== null && user.nativeAiTokensUsedMonth >= user.nativeAiMonthlyTokenLimit) return res.status(403).json({ error: 'Monthly token limit reached' });
     }
 
     const agentCtx = await prepareAiAgentRequest(req.user.id, bookId, messages);
@@ -134,6 +178,34 @@ app.post('/api/ai/agent', authenticateToken, async (req, res) => {
       }
       aiResponseText = claudeData.content?.[0]?.text || '';
 
+    } else if (provider === 'hisabpata_ai') {
+      const ollamaUrl = process.env.OLLAMA_API_URL || 'http://localhost:11434';
+      const ollamaModel = process.env.OLLAMA_DEFAULT_MODEL || 'llama3';
+      const url = `${ollamaUrl}/v1/chat/completions`;
+      const formattedMessages = [
+        { role: 'system', content: systemPrompt },
+        ...llmMessages.map(m => ({ role: m.role, content: m.content }))
+      ];
+
+      const ollamaRes = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: ollamaModel, messages: formattedMessages, temperature: tempVal })
+      });
+      const ollamaData = await ollamaRes.json();
+      if (!ollamaRes.ok) return res.status(ollamaRes.status).json({ error: ollamaData.error?.message || 'Ollama API Error' });
+      
+      aiResponseText = ollamaData.choices?.[0]?.message?.content || '';
+      const promptText = JSON.stringify(formattedMessages);
+      const estimatedTokens = Math.ceil((promptText.length + aiResponseText.length) / 4);
+      await prisma.user.update({
+        where: { id: req.user.id },
+        data: {
+          nativeAiTokensUsedTotal: { increment: estimatedTokens },
+          nativeAiTokensUsedToday: { increment: estimatedTokens },
+          nativeAiTokensUsedMonth: { increment: estimatedTokens },
+        }
+      });
     } else {
       return res.status(400).json({ error: 'Unsupported provider' });
     }
@@ -182,13 +254,26 @@ app.post('/api/ai/agent/stream', authenticateToken, async (req, res) => {
       maxTokens: resolved.maxTokens,
     };
 
-    if (!provider || !apiKey || !messages) {
-      return res.status(400).json({ error: 'Missing required fields: provider, apiKey, messages' });
+    if (!provider || !messages) {
+      return res.status(400).json({ error: 'Missing required fields: provider, messages' });
     }
-    if (!model || !String(model).trim()) {
+    if (provider !== 'hisabpata_ai' && !apiKey) {
+      return res.status(400).json({ error: 'Missing required API key' });
+    }
+    if (provider !== 'hisabpata_ai' && (!model || !String(model).trim())) {
       return res.status(400).json({
         error: 'AI model is not selected. Run Find Working Models in AI settings, pick a model, and save.',
       });
+    }
+
+    if (provider === 'hisabpata_ai') {
+      let user = await prisma.user.findUnique({ where: { id: req.user.id } });
+      user = await checkAndResetUserTokens(user);
+      if (user.nativeAiStatus !== 'approved') return res.status(403).json({ error: 'Native AI access not approved' });
+      if (user.nativeAiExpiry && new Date(user.nativeAiExpiry) < new Date()) return res.status(403).json({ error: 'Native AI access expired' });
+      if (user.nativeAiTotalTokenLimit !== null && user.nativeAiTokensUsedTotal >= user.nativeAiTotalTokenLimit) return res.status(403).json({ error: 'Total token limit reached' });
+      if (user.nativeAiDailyTokenLimit !== null && user.nativeAiTokensUsedToday >= user.nativeAiDailyTokenLimit) return res.status(403).json({ error: 'Daily token limit reached' });
+      if (user.nativeAiMonthlyTokenLimit !== null && user.nativeAiTokensUsedMonth >= user.nativeAiMonthlyTokenLimit) return res.status(403).json({ error: 'Monthly token limit reached' });
     }
 
     const agentCtx = await prepareAiAgentRequest(req.user.id, bookId, messages);
@@ -426,6 +511,75 @@ app.post('/api/ai/agent/stream', authenticateToken, async (req, res) => {
       }
 
       await emitAiStreamFinal(sendEvent, fullText, agentCtx, req.user.id, messages, { model, provider });
+
+    } else if (provider === 'hisabpata_ai') {
+      const ollamaUrl = process.env.OLLAMA_API_URL || 'http://localhost:11434';
+      const ollamaModel = process.env.OLLAMA_DEFAULT_MODEL || 'llama3';
+      const url = `${ollamaUrl}/v1/chat/completions`;
+      const formattedMessages = [
+        { role: 'system', content: systemPrompt },
+        ...llmMessages.map(m => ({ role: m.role, content: m.content }))
+      ];
+
+      const ollamaRes = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: ollamaModel,
+          messages: formattedMessages,
+          temperature: tempVal,
+          stream: true
+        })
+      });
+
+      if (!ollamaRes.ok) {
+        const errData = await ollamaRes.json().catch(() => ({}));
+        sendEvent('error', { message: errData.error?.message || 'Ollama API Error' });
+        sendEvent('done', {});
+        return res.end();
+      }
+
+      const reader = ollamaRes.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+      let fullText = '';
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+
+        for (const line of lines) {
+          if (line.startsWith('data: ')) {
+            const jsonStr = line.slice(6).trim();
+            if (jsonStr === '[DONE]') continue;
+            try {
+              const data = JSON.parse(jsonStr);
+              const content = data.choices?.[0]?.delta?.content || '';
+              if (content) {
+                fullText += content;
+                sendEvent('chunk', { content });
+              }
+            } catch (e) { /* skip */ }
+          }
+        }
+      }
+
+      const promptText = JSON.stringify(formattedMessages);
+      const estimatedTokens = Math.ceil((promptText.length + fullText.length) / 4);
+      await prisma.user.update({
+        where: { id: req.user.id },
+        data: {
+          nativeAiTokensUsedTotal: { increment: estimatedTokens },
+          nativeAiTokensUsedToday: { increment: estimatedTokens },
+          nativeAiTokensUsedMonth: { increment: estimatedTokens },
+        }
+      });
+
+      await emitAiStreamFinal(sendEvent, fullText, agentCtx, req.user.id, messages, { model: ollamaModel, provider });
 
     } else {
       sendEvent('error', { message: `Unsupported provider: ${provider}` });

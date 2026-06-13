@@ -16,6 +16,15 @@ model User {
   tokenVersion  Int                  @default(0)
   avatarUrl     String?
   isAdmin       Boolean              @default(false)
+  nativeAiStatus String              @default("none")
+  nativeAiExpiry DateTime?
+  nativeAiTotalTokenLimit Int?
+  nativeAiDailyTokenLimit Int?
+  nativeAiMonthlyTokenLimit Int?
+  nativeAiTokensUsedTotal Int        @default(0)
+  nativeAiTokensUsedToday Int        @default(0)
+  nativeAiTokensUsedMonth Int        @default(0)
+  nativeAiLastTokenReset DateTime   @default(now())
   aiConfig      Json?
   aiChatMessages AiChatMessage[]
   memberships   OrganizationMember[]
@@ -23,6 +32,22 @@ model User {
   audioNotes    AudioNote[]
   createdAt     DateTime             @default(now())
   updatedAt     DateTime             @updatedAt
+}
+
+model Admin {
+  id        String   @id @default(cuid())
+  name      String
+  email     String   @unique
+  password  String
+  role      String   @default("superadmin")
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model SystemSetting {
+  key       String   @id
+  value     String
+  updatedAt DateTime @updatedAt
 }
 
 model AiChatMessage {

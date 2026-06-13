@@ -1,11 +1,90 @@
 const { prisma } = require('../config/database');
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
+
+const JWT_SECRET_FINAL = process.env.JWT_SECRET || 'dev_secret_key_do_not_use_in_production';
 
 module.exports = function(app, { authenticateToken, authenticateAdmin, upload }) {
+
+app.get('/api/admin/settings', authenticateAdmin, async (req, res) => {
+  try {
+    const settings = await prisma.systemSetting.findMany();
+    const result = {};
+    settings.forEach(s => result[s.key] = s.value);
+    res.json(result);
+  } catch (error) {
+    console.error('[Admin] Failed to fetch settings:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.post('/api/admin/settings', authenticateAdmin, async (req, res) => {
+  try {
+    const { key, value } = req.body;
+    if (!key) return res.status(400).json({ error: 'Key is required' });
+    
+    const setting = await prisma.systemSetting.upsert({
+      where: { key },
+      update: { value },
+      create: { key, value },
+    });
+    res.json(setting);
+  } catch (error) {
+    console.error('[Admin] Failed to update setting:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.post('/api/admin/login', async (req, res) => {
+  try {
+    const { email, password } = req.body;
+    if (!email || !password) {
+      return res.status(400).json({ error: 'Email and password are required' });
+    }
+
+    const admin = await prisma.admin.findUnique({ where: { email } });
+    if (!admin) {
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
+
+    const valid = await bcrypt.compare(password, admin.password);
+    if (!valid) {
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
+
+    const token = jwt.sign(
+      { id: admin.id, email: admin.email, role: admin.role },
+      JWT_SECRET_FINAL,
+      { expiresIn: '7d' }
+    );
+
+    res.json({ token, admin: { id: admin.id, name: admin.name, email: admin.email, role: admin.role } });
+  } catch (error) {
+    console.error('[Admin] Login error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
 
 app.get('/api/admin/users', authenticateAdmin, async (req, res) => {
   try {
     const users = await prisma.user.findMany({
-      select: { id: true, name: true, email: true, phoneNumber: true, isAdmin: true, avatarUrl: true, createdAt: true },
+      select: {
+        id: true,
+        name: true,
+        email: true,
+        phoneNumber: true,
+        isAdmin: true,
+        avatarUrl: true,
+        createdAt: true,
+        nativeAiStatus: true,
+        nativeAiExpiry: true,
+        nativeAiTotalTokenLimit: true,
+        nativeAiDailyTokenLimit: true,
+        nativeAiMonthlyTokenLimit: true,
+        nativeAiTokensUsedTotal: true,
+        nativeAiTokensUsedToday: true,
+        nativeAiTokensUsedMonth: true,
+      },
       orderBy: { createdAt: 'desc' },
     });
     res.json(users);
@@ -177,6 +256,43 @@ app.delete('/api/admin/orgs/:id', authenticateAdmin, async (req, res) => {
     res.json({ message: 'Organization deleted successfully' });
   } catch (error) {
     console.error('[Admin] Failed to delete org:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.put('/api/admin/users/:id', authenticateAdmin, async (req, res) => {
+  try {
+    const { 
+      isAdmin, 
+      nativeAiStatus, 
+      nativeAiExpiry, 
+      nativeAiTotalTokenLimit, 
+      nativeAiDailyTokenLimit, 
+      nativeAiMonthlyTokenLimit 
+    } = req.body;
+    
+    const data = {};
+    if (isAdmin !== undefined) data.isAdmin = isAdmin;
+    if (nativeAiStatus !== undefined) data.nativeAiStatus = nativeAiStatus;
+    if (nativeAiExpiry !== undefined) data.nativeAiExpiry = nativeAiExpiry ? new Date(nativeAiExpiry) : null;
+    if (nativeAiTotalTokenLimit !== undefined) data.nativeAiTotalTokenLimit = nativeAiTotalTokenLimit ? parseInt(nativeAiTotalTokenLimit) : null;
+    if (nativeAiDailyTokenLimit !== undefined) data.nativeAiDailyTokenLimit = nativeAiDailyTokenLimit ? parseInt(nativeAiDailyTokenLimit) : null;
+    if (nativeAiMonthlyTokenLimit !== undefined) data.nativeAiMonthlyTokenLimit = nativeAiMonthlyTokenLimit ? parseInt(nativeAiMonthlyTokenLimit) : null;
+
+    const user = await prisma.user.update({
+      where: { id: req.params.id },
+      data,
+      select: { 
+        id: true, name: true, email: true, phoneNumber: true, isAdmin: true, 
+        avatarUrl: true, createdAt: true, nativeAiStatus: true,
+        nativeAiExpiry: true, nativeAiTotalTokenLimit: true,
+        nativeAiDailyTokenLimit: true, nativeAiMonthlyTokenLimit: true,
+        nativeAiTokensUsedTotal: true, nativeAiTokensUsedToday: true, nativeAiTokensUsedMonth: true
+      },
+    });
+    res.json(user);
+  } catch (error) {
+    console.error('[Admin] Failed to update user:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });

@@ -31,13 +31,30 @@ const authenticateToken = (req, res, next) => {
 };
 
 const authenticateAdmin = (req, res, next) => {
-  const adminKey = req.headers['x-admin-key'];
-  const expectedKey = (process.env.ADMIN_KEY || '').trim();
-  if (!adminKey || adminKey !== expectedKey) {
-    console.error(`ADMIN_AUTH_FAIL: provided="${adminKey?.length || 0}chars" expected="${expectedKey?.length || 0}chars" path="${req.path}"`);
-    return res.status(401).json({ error: 'Valid admin key required' });
+  const authHeader = req.headers['authorization'];
+  const token = authHeader && authHeader.split(' ')[1];
+
+  if (!token) {
+    return res.status(401).json({ error: 'Access token required' });
   }
-  next();
+
+  jwt.verify(token, JWT_SECRET_FINAL, async (err, decoded) => {
+    if (err) {
+      return res.status(403).json({ error: 'Invalid or expired token' });
+    }
+
+    try {
+      const dbAdmin = await prisma.admin.findUnique({ where: { id: decoded.id } });
+      if (!dbAdmin) {
+        return res.status(403).json({ error: 'Admin access revoked' });
+      }
+      req.admin = dbAdmin;
+      next();
+    } catch (dbErr) {
+      console.error('Admin Auth middleware error:', dbErr);
+      return res.status(500).json({ error: 'Internal server error during auth' });
+    }
+  });
 };
 
 module.exports = { authenticateToken, authenticateAdmin };

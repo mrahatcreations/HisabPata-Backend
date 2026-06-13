@@ -36,8 +36,36 @@ function resolveAiRequestConfig(body, storedConfig) {
   };
 }
 
+const fs = require('fs');
+const path = require('path');
+
+async function saveNativeAiLog(userMessage, systemPrompt, assistantMessage, model) {
+  try {
+    const logDir = path.join(__dirname, '../../../../data');
+    if (!fs.existsSync(logDir)) {
+      fs.mkdirSync(logDir, { recursive: true });
+    }
+    const logFile = path.join(logDir, 'native_ai_logs.jsonl');
+    
+    const logEntry = {
+      timestamp: new Date().toISOString(),
+      model: model,
+      messages: [
+        { role: 'system', content: systemPrompt || '' },
+        { role: 'user', content: userMessage || '' },
+        { role: 'assistant', content: assistantMessage || '' }
+      ]
+    };
+    
+    fs.appendFileSync(logFile, JSON.stringify(logEntry) + '\n', 'utf8');
+  } catch (error) {
+    console.error('[AI Log] Failed to save native AI JSON log:', error);
+  }
+}
+
 module.exports = {
   saveAiChatTurn,
   loadUserAiConfig,
   resolveAiRequestConfig,
+  saveNativeAiLog,
 };
