@@ -402,4 +402,99 @@ app.post('/api/admin/reset', authenticateAdmin, async (req, res) => {
   }
 });
 
+// --- Generic Database CRUD (Google Sheets-like) ---
+
+const DB_MODELS = [
+  'User', 'Organization', 'OrganizationMember', 'Book', 'Transaction',
+  'Complaint', 'AiChatMessage', 'AudioNote', 'Notification',
+  'NotificationPreference', 'FcmToken', 'Category', 'SystemSetting',
+];
+
+const DB_MODEL_RELATIONS = {
+  User: { memberships: true, complaints: true, aiChatMessages: true, audioNotes: true },
+  Organization: { members: true, books: true },
+  OrganizationMember: { user: true, organization: true },
+  Book: { organization: true, transactions: true },
+  Complaint: { user: true },
+  AiChatMessage: { user: true },
+  AudioNote: { user: true },
+};
+
+function getPrismaModel(name) {
+  const key = name.charAt(0).toLowerCase() + name.slice(1);
+  return prisma[key];
+}
+
+app.get('/api/admin/db', authenticateAdmin, (_req, res) => {
+  res.json(DB_MODELS);
+});
+
+app.get('/api/admin/db/:model', authenticateAdmin, async (req, res) => {
+  try {
+    const { model } = req.params;
+    if (!DB_MODELS.includes(model)) return res.status(400).json({ error: 'Invalid model' });
+    const delegate = getPrismaModel(model);
+    const include = DB_MODEL_RELATIONS[model] || undefined;
+    const records = await delegate.findMany({ include, orderBy: { createdAt: 'desc' } });
+    res.json(records);
+  } catch (error) {
+    console.error(`[DB] Failed to fetch ${req.params.model}:`, error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/admin/db/:model/:id', authenticateAdmin, async (req, res) => {
+  try {
+    const { model, id } = req.params;
+    if (!DB_MODELS.includes(model)) return res.status(400).json({ error: 'Invalid model' });
+    const delegate = getPrismaModel(model);
+    const include = DB_MODEL_RELATIONS[model] || undefined;
+    const record = await delegate.findUnique({ where: { id }, include });
+    if (!record) return res.status(404).json({ error: 'Record not found' });
+    res.json(record);
+  } catch (error) {
+    console.error(`[DB] Failed to fetch ${req.params.model}/${req.params.id}:`, error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/admin/db/:model', authenticateAdmin, async (req, res) => {
+  try {
+    const { model } = req.params;
+    if (!DB_MODELS.includes(model)) return res.status(400).json({ error: 'Invalid model' });
+    const delegate = getPrismaModel(model);
+    const record = await delegate.create({ data: req.body });
+    res.status(201).json(record);
+  } catch (error) {
+    console.error(`[DB] Failed to create ${req.params.model}:`, error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.put('/api/admin/db/:model/:id', authenticateAdmin, async (req, res) => {
+  try {
+    const { model, id } = req.params;
+    if (!DB_MODELS.includes(model)) return res.status(400).json({ error: 'Invalid model' });
+    const delegate = getPrismaModel(model);
+    const record = await delegate.update({ where: { id }, data: req.body });
+    res.json(record);
+  } catch (error) {
+    console.error(`[DB] Failed to update ${req.params.model}/${req.params.id}:`, error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.delete('/api/admin/db/:model/:id', authenticateAdmin, async (req, res) => {
+  try {
+    const { model, id } = req.params;
+    if (!DB_MODELS.includes(model)) return res.status(400).json({ error: 'Invalid model' });
+    const delegate = getPrismaModel(model);
+    await delegate.delete({ where: { id } });
+    res.json({ message: 'Deleted' });
+  } catch (error) {
+    console.error(`[DB] Failed to delete ${req.params.model}/${req.params.id}:`, error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 };
