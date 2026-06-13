@@ -17,10 +17,10 @@ function normalizeAiConfigPayload(body = {}) {
   const temperature = body.temperature != null ? parseFloat(body.temperature) : 0.7;
   const maxTokens = body.maxTokens != null ? parseInt(body.maxTokens, 10) : 2048;
 
-  if (!AI_CONFIG_PROVIDERS.has(provider)) {
-    return { error: 'Invalid provider. Use gemini, openai, or claude.' };
+  if (!AI_CONFIG_PROVIDERS.has(provider) && provider !== 'hisabpata_ai') {
+    return { error: 'Invalid provider. Use gemini, openai, claude, or hisabpata_ai.' };
   }
-  if (!apiKey) {
+  if (!apiKey && provider !== 'hisabpata_ai') {
     return { error: 'API key is required' };
   }
   if (!selectedModel && workingModels.length === 0) {
