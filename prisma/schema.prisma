@@ -47,6 +47,7 @@ model Admin {
 model SystemSetting {
   key       String   @id
   value     String
+  createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 }
 
@@ -229,12 +230,13 @@ model Notification {
 }
 
 model NotificationPreference {
-  id                String  @id @default(cuid())
+  id                String   @id @default(cuid())
   userId            String
   type              String
-  pushEnabled       Boolean @default(true)
-  emailEnabled      Boolean @default(true)
-  inAppEnabled      Boolean @default(true)
+  pushEnabled       Boolean  @default(true)
+  emailEnabled      Boolean  @default(true)
+  inAppEnabled      Boolean  @default(true)
+  createdAt         DateTime @default(now())
 
   @@unique([userId, type])
   @@index([userId])

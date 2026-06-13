@@ -233,6 +233,26 @@ app.delete('/api/admin/orgs/:id/members/:memberId', authenticateAdmin, async (re
   }
 });
 
+app.put('/api/admin/orgs/:id', authenticateAdmin, async (req, res) => {
+  try {
+    const { name, isPersonal, approvalPolicy, categories } = req.body;
+    const data = {};
+    if (name !== undefined) data.name = name;
+    if (isPersonal !== undefined) data.isPersonal = isPersonal;
+    if (approvalPolicy !== undefined) data.approvalPolicy = approvalPolicy;
+    if (categories !== undefined) data.categories = categories;
+
+    const org = await prisma.organization.update({
+      where: { id: req.params.id },
+      data,
+    });
+    res.json(org);
+  } catch (error) {
+    console.error('[Admin] Failed to update org:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 app.delete('/api/admin/orgs/:id', authenticateAdmin, async (req, res) => {
   try {
     const org = await prisma.organization.findUnique({ where: { id: req.params.id } });
@@ -433,13 +453,20 @@ app.get('/api/admin/db', authenticateAdmin, (_req, res) => {
   res.json(DB_MODELS);
 });
 
+const MODELS_WITH_CREATED_AT = [
+  'User', 'Admin', 'AiChatMessage', 'Complaint', 'Organization',
+  'OrganizationMember', 'Book', 'Transaction', 'AudioNote',
+  'Notification', 'NotificationPreference', 'FcmToken', 'Category', 'SystemSetting',
+];
+
 app.get('/api/admin/db/:model', authenticateAdmin, async (req, res) => {
   try {
     const { model } = req.params;
     if (!DB_MODELS.includes(model)) return res.status(400).json({ error: 'Invalid model' });
     const delegate = getPrismaModel(model);
     const include = DB_MODEL_RELATIONS[model] || undefined;
-    const records = await delegate.findMany({ include, orderBy: { createdAt: 'desc' } });
+    const orderBy = MODELS_WITH_CREATED_AT.includes(model) ? { createdAt: 'desc' } : undefined;
+    const records = await delegate.findMany({ include, orderBy });
     res.json(records);
   } catch (error) {
     console.error(`[DB] Failed to fetch ${req.params.model}:`, error);
