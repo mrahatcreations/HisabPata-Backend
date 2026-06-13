@@ -143,6 +143,13 @@ module.exports = function(app) {
           tokenVersion: user.tokenVersion,
           avatarUrl: user.avatarUrl,
           nativeAiStatus: user.nativeAiStatus,
+          nativeAiExpiry: user.nativeAiExpiry,
+          nativeAiTotalTokenLimit: user.nativeAiTotalTokenLimit,
+          nativeAiDailyTokenLimit: user.nativeAiDailyTokenLimit,
+          nativeAiMonthlyTokenLimit: user.nativeAiMonthlyTokenLimit,
+          nativeAiTokensUsedTotal: user.nativeAiTokensUsedTotal,
+          nativeAiTokensUsedToday: user.nativeAiTokensUsedToday,
+          nativeAiTokensUsedMonth: user.nativeAiTokensUsedMonth,
         },
         organizations: orgs.map(o => ({
           id: o.id,
