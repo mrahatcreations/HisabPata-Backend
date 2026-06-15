@@ -30,7 +30,7 @@ const allowedOrigins = isCorsWildcard
   ? true
   : corsOrigins
     ? corsOrigins.split(',').map(s => s.trim())
-    : ['http://localhost:3000', 'http://127.0.0.1:3000', 'http://localhost:5000', 'http://127.0.0.1:5000', 'http://localhost:5173', 'http://127.0.0.1:5173', 'http://192.168.0.110:8099', 'http://localhost:8099', 'http://127.0.0.1:8099'];
+    : ['http://localhost:3000', 'http://127.0.0.1:3000', 'http://localhost:3001', 'http://127.0.0.1:3001', 'http://localhost:5000', 'http://127.0.0.1:5000', 'http://localhost:5173', 'http://127.0.0.1:5173', 'http://localhost:8080', 'http://127.0.0.1:8080', 'http://192.168.0.110:8099', 'http://localhost:8099', 'http://127.0.0.1:8099'];
 
 app.use(helmet({ crossOriginResourcePolicy: { policy: 'cross-origin' } }));
 app.use(cors({ origin: allowedOrigins, credentials: !isCorsWildcard }));
@@ -94,8 +94,6 @@ require('./routes/auth')(app);
 require('./routes/authGoogle')(app);
 require('./routes/org')(app);
 require('./routes/user')(app);
-require('./routes/ai')(app);
-require('./routes/aiTools')(app);
 require('./routes/books')(app, { authenticateToken, recalculateBookBalance });
 require('./routes/categories')(app, { authenticateToken });
 require('./routes/notifications')(app, { authenticateToken });

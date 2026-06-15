@@ -76,38 +76,12 @@ app.get('/api/admin/users', authenticateAdmin, async (req, res) => {
         isAdmin: true,
         avatarUrl: true,
         createdAt: true,
-        nativeAiStatus: true,
-        nativeAiExpiry: true,
-        nativeAiTotalTokenLimit: true,
-        nativeAiDailyTokenLimit: true,
-        nativeAiMonthlyTokenLimit: true,
-        nativeAiTokensUsedTotal: true,
-        nativeAiTokensUsedToday: true,
-        nativeAiTokensUsedMonth: true,
       },
       orderBy: { createdAt: 'desc' },
     });
     res.json(users);
   } catch (error) {
     console.error('[Admin] Failed to fetch users:', error);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-app.get('/api/admin/ai-chats', authenticateAdmin, async (req, res) => {
-  try {
-    const limit = Math.min(parseInt(req.query.limit, 10) || 100, 500);
-    const userId = req.query.userId;
-    const where = userId ? { userId } : {};
-    const messages = await prisma.aiChatMessage.findMany({
-      where,
-      include: { user: { select: { id: true, name: true, email: true, phoneNumber: true } } },
-      orderBy: { createdAt: 'desc' },
-      take: limit,
-    });
-    res.json(messages);
-  } catch (error) {
-    console.error('[Admin] Failed to fetch AI chats:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -283,31 +257,18 @@ app.delete('/api/admin/orgs/:id', authenticateAdmin, async (req, res) => {
 app.put('/api/admin/users/:id', authenticateAdmin, async (req, res) => {
   try {
     const { 
-      isAdmin, 
-      nativeAiStatus, 
-      nativeAiExpiry, 
-      nativeAiTotalTokenLimit, 
-      nativeAiDailyTokenLimit, 
-      nativeAiMonthlyTokenLimit 
+      isAdmin 
     } = req.body;
     
     const data = {};
     if (isAdmin !== undefined) data.isAdmin = isAdmin;
-    if (nativeAiStatus !== undefined) data.nativeAiStatus = nativeAiStatus;
-    if (nativeAiExpiry !== undefined) data.nativeAiExpiry = nativeAiExpiry ? new Date(nativeAiExpiry) : null;
-    if (nativeAiTotalTokenLimit !== undefined) data.nativeAiTotalTokenLimit = nativeAiTotalTokenLimit ? parseInt(nativeAiTotalTokenLimit) : null;
-    if (nativeAiDailyTokenLimit !== undefined) data.nativeAiDailyTokenLimit = nativeAiDailyTokenLimit ? parseInt(nativeAiDailyTokenLimit) : null;
-    if (nativeAiMonthlyTokenLimit !== undefined) data.nativeAiMonthlyTokenLimit = nativeAiMonthlyTokenLimit ? parseInt(nativeAiMonthlyTokenLimit) : null;
 
     const user = await prisma.user.update({
       where: { id: req.params.id },
       data,
       select: { 
         id: true, name: true, email: true, phoneNumber: true, isAdmin: true, 
-        avatarUrl: true, createdAt: true, nativeAiStatus: true,
-        nativeAiExpiry: true, nativeAiTotalTokenLimit: true,
-        nativeAiDailyTokenLimit: true, nativeAiMonthlyTokenLimit: true,
-        nativeAiTokensUsedTotal: true, nativeAiTokensUsedToday: true, nativeAiTokensUsedMonth: true
+        avatarUrl: true, createdAt: true
       },
     });
 
@@ -430,17 +391,16 @@ app.post('/api/admin/reset', authenticateAdmin, async (req, res) => {
 
 const DB_MODELS = [
   'User', 'Organization', 'OrganizationMember', 'Book', 'Transaction',
-  'Complaint', 'AiChatMessage', 'AudioNote', 'Notification',
+  'Complaint', 'AudioNote', 'Notification',
   'NotificationPreference', 'FcmToken', 'Category', 'SystemSetting',
 ];
 
 const DB_MODEL_RELATIONS = {
-  User: { memberships: true, complaints: true, aiChatMessages: true, audioNotes: true },
+  User: { memberships: true, complaints: true, audioNotes: true },
   Organization: { members: true, books: true },
   OrganizationMember: { user: true, organization: true },
   Book: { organization: true, transactions: true },
   Complaint: { user: true },
-  AiChatMessage: { user: true },
   AudioNote: { user: true },
 };
 
@@ -454,7 +414,7 @@ app.get('/api/admin/db', authenticateAdmin, (_req, res) => {
 });
 
 const MODELS_WITH_CREATED_AT = [
-  'User', 'Admin', 'AiChatMessage', 'Complaint', 'Organization',
+  'User', 'Admin', 'Complaint', 'Organization',
   'OrganizationMember', 'Book', 'Transaction', 'AudioNote',
   'Notification', 'NotificationPreference', 'FcmToken', 'Category', 'SystemSetting',
 ];

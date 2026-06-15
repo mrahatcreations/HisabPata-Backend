@@ -1,131 +1,7 @@
 const { prisma } = require('../config/database');
 const { authenticateToken } = require('../middleware/auth');
 
-// ─────────────────────────────────────────────────────────────────────────────
-// USER AI CONFIG — per-account cloud storage for AI agent
-// ─────────────────────────────────────────────────────────────────────────────
-const AI_CONFIG_PROVIDERS = new Set(['gemini', 'openai', 'claude']);
-
-function normalizeAiConfigPayload(body = {}) {
-  const provider = typeof body.provider === 'string' ? body.provider.trim().toLowerCase() : '';
-  const apiKey = typeof body.apiKey === 'string' ? body.apiKey.trim() : '';
-  const selectedModel = typeof body.selectedModel === 'string' ? body.selectedModel.trim() : '';
-  const workingModels = Array.isArray(body.workingModels)
-    ? body.workingModels.map((m) => String(m).trim()).filter(Boolean)
-    : [];
-  const baseUrl = typeof body.baseUrl === 'string' ? body.baseUrl.trim() : '';
-  const temperature = body.temperature != null ? parseFloat(body.temperature) : 0.7;
-  const maxTokens = body.maxTokens != null ? parseInt(body.maxTokens, 10) : 2048;
-
-  if (!AI_CONFIG_PROVIDERS.has(provider) && provider !== 'hisabpata_ai') {
-    return { error: 'Invalid provider. Use gemini, openai, claude, or hisabpata_ai.' };
-  }
-  if (!apiKey && provider !== 'hisabpata_ai') {
-    return { error: 'API key is required' };
-  }
-  if (!selectedModel && workingModels.length === 0) {
-    return { error: 'At least one model must be configured' };
-  }
-
-  return {
-    config: {
-      provider,
-      apiKey,
-      selectedModel: selectedModel || workingModels[0],
-      workingModels,
-      baseUrl,
-      temperature: Number.isFinite(temperature) ? temperature : 0.7,
-      maxTokens: Number.isFinite(maxTokens) ? maxTokens : 512,
-      updatedAt: new Date().toISOString(),
-    },
-  };
-}
-
-async function loadUserAiConfig(userId) {
-  const user = await prisma.user.findUnique({
-    where: { id: userId },
-    select: { aiConfig: true },
-  });
-  return user?.aiConfig || null;
-}
-
-function resolveAiRequestConfig(body, storedConfig) {
-  const cfg = storedConfig && typeof storedConfig === 'object' ? storedConfig : {};
-  return {
-    provider: body.provider || cfg.provider,
-    apiKey: body.apiKey || cfg.apiKey,
-    model: body.model || cfg.selectedModel,
-    baseUrl: body.baseUrl || cfg.baseUrl || null,
-    temperature: body.temperature != null ? parseFloat(body.temperature) : cfg.temperature,
-    maxTokens: body.maxTokens != null ? parseInt(body.maxTokens, 10) : cfg.maxTokens,
-  };
-}
-
 module.exports = function(app) {
-  app.get('/api/user/ai-config', authenticateToken, async (req, res) => {
-    try {
-      const cfg = await loadUserAiConfig(req.user.id);
-      if (!cfg || !cfg.apiKey) {
-        return res.json({ configured: false, config: null });
-      }
-      const safeConfig = { ...cfg, apiKey: cfg.apiKey.substring(0, 4) + '...' + cfg.apiKey.slice(-4) };
-      return res.json({ configured: true, config: safeConfig });
-    } catch (error) {
-      console.error('[AI Config] Fetch error:', error);
-      res.status(500).json({ error: 'Server error fetching AI configuration' });
-    }
-  });
-
-  app.put('/api/user/ai-config', authenticateToken, async (req, res) => {
-    try {
-      const normalized = normalizeAiConfigPayload(req.body);
-      if (normalized.error) {
-        return res.status(400).json({ error: normalized.error });
-      }
-
-      await prisma.user.update({
-        where: { id: req.user.id },
-        data: { aiConfig: normalized.config },
-      });
-
-      const ws = require('../websocket');
-      if (ws.broadcastToUser) {
-        ws.broadcastToUser(req.user.id, {
-          type: 'user_updated',
-          user: { id: req.user.id, aiConfig: normalized.config },
-        });
-      }
-
-      const safeConfig = { ...normalized.config, apiKey: normalized.config.apiKey.substring(0, 4) + '...' + normalized.config.apiKey.slice(-4) };
-      res.json({ message: 'AI configuration saved', config: safeConfig });
-    } catch (error) {
-      console.error('[AI Config] Save error:', error);
-      res.status(500).json({ error: 'Server error saving AI configuration' });
-    }
-  });
-
-  app.delete('/api/user/ai-config', authenticateToken, async (req, res) => {
-    try {
-      await prisma.user.update({
-        where: { id: req.user.id },
-        data: { aiConfig: null },
-      });
-
-      const ws = require('../websocket');
-      if (ws.broadcastToUser) {
-        ws.broadcastToUser(req.user.id, {
-          type: 'user_updated',
-          user: { id: req.user.id, aiConfig: null },
-        });
-      }
-
-      res.json({ message: 'AI configuration reset' });
-    } catch (error) {
-      console.error('[AI Config] Delete error:', error);
-      res.status(500).json({ error: 'Server error resetting AI configuration' });
-    }
-  });
-
   // Get Current Profile & State
   app.get('/api/user/profile', authenticateToken, async (req, res) => {
     try {
@@ -172,14 +48,6 @@ module.exports = function(app) {
           phoneNumber: user.phoneNumber,
           tokenVersion: user.tokenVersion,
           avatarUrl: user.avatarUrl,
-          nativeAiStatus: user.nativeAiStatus,
-          nativeAiExpiry: user.nativeAiExpiry,
-          nativeAiTotalTokenLimit: user.nativeAiTotalTokenLimit,
-          nativeAiDailyTokenLimit: user.nativeAiDailyTokenLimit,
-          nativeAiMonthlyTokenLimit: user.nativeAiMonthlyTokenLimit,
-          nativeAiTokensUsedTotal: user.nativeAiTokensUsedTotal,
-          nativeAiTokensUsedToday: user.nativeAiTokensUsedToday,
-          nativeAiTokensUsedMonth: user.nativeAiTokensUsedMonth,
         },
         organizations: orgs.map(o => ({
           id: o.id,
@@ -389,30 +257,4 @@ module.exports = function(app) {
     }
   });
 
-  // Request Native AI Access
-  app.post('/api/user/request-ai-access', authenticateToken, async (req, res) => {
-    try {
-      const user = await prisma.user.findUnique({ where: { id: req.user.id } });
-      if (!user) {
-        return res.status(404).json({ error: 'User not found' });
-      }
-
-      if (user.nativeAiStatus === 'approved') {
-        return res.status(400).json({ error: 'AI access is already approved' });
-      }
-
-      const updatedUser = await prisma.user.update({
-        where: { id: req.user.id },
-        data: { nativeAiStatus: 'pending' },
-      });
-
-      const ws = require('../websocket');
-      if (ws.broadcastToUser) ws.broadcastToUser(req.user.id, { type: 'user_updated', user: { id: req.user.id, nativeAiStatus: 'pending' } });
-
-      res.json({ message: 'Request submitted successfully', nativeAiStatus: updatedUser.nativeAiStatus });
-    } catch (error) {
-      console.error('Request AI access error:', error);
-      res.status(500).json({ error: 'Server error requesting AI access' });
-    }
-  });
 };

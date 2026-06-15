@@ -65,47 +65,8 @@ app.post('/api/audio-notes/upload', authenticateToken, upload.single('audio'), a
       req.file.mimetype
     );
 
-    // Fallback: Gemini (legacy) when BanglaSpeechAPI is not configured
     if (!transcribedText) {
-      if (!user.aiConfig) {
-        return res.status(400).json({
-          error: 'ASR not configured on server and no AI config for fallback',
-        });
-      }
-      const aiConfig = typeof user.aiConfig === 'string' ? JSON.parse(user.aiConfig) : user.aiConfig;
-      const apiKey = aiConfig.apiKey;
-      if (!apiKey) {
-        return res.status(400).json({ error: 'Set ASR_API_KEY on server or Gemini API Key in settings' });
-      }
-
-      const audioData = fs.readFileSync(req.file.path).toString('base64');
-      const mimeType = req.file.mimetype || 'audio/m4a';
-      const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`;
-      const aiReqBody = {
-        contents: [{
-          parts: [
-            { text: 'Listen to this audio and perfectly transcribe exactly what is spoken. If it is in Bengali, write in Bengali text. DO NOT add any extra commentary or formatting, just output the raw text.' },
-            { inlineData: { mimeType: mimeType, data: audioData } }
-          ]
-        }],
-        generationConfig: { temperature: 0.2 }
-      };
-
-      const aiRes = await fetch(geminiUrl, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(aiReqBody)
-      });
-
       transcribedText = 'Unclear audio / Processing failed';
-      if (aiRes.ok) {
-        const aiData = await aiRes.json();
-        if (aiData.candidates && aiData.candidates[0]?.content?.parts) {
-          transcribedText = aiData.candidates[0].content.parts[0].text.trim();
-        }
-      } else {
-        console.error('Gemini API Error:', await aiRes.text());
-      }
     }
 
     let audioUrl = `/uploads/${req.file.filename}`;
