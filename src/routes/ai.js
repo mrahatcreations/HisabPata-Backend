@@ -65,9 +65,13 @@ module.exports = (app) => {
 
   router.post('/chat', async (req, res) => {
     try {
-      const { message, context } = req.body;
+      const { messages: clientMessages, message, context } = req.body;
 
-      const ruled = ruleHandle(message, context);
+      const latestMsg = clientMessages?.length > 0
+        ? clientMessages[clientMessages.length - 1]?.content || message || ''
+        : message || '';
+
+      const ruled = ruleHandle(latestMsg, context);
       if (ruled) {
         if (ruled.intent === 'add_expense' && ruled.action === 'ask_confirm') {
           pendingExpense = { ...ruled.slots, type: 'expense' };
@@ -88,9 +92,11 @@ module.exports = (app) => {
         contextBlock = `\nbook_type: personal\ncategories: ${cats}\nbalance: ${bal}`;
       }
 
+      const history = (clientMessages || []).slice(0, -1).filter(m => m.role === 'user' || m.role === 'assistant');
       const messages = [
         { role: 'system', content: SYSTEM_PROMPT + contextBlock },
-        { role: 'user', content: message },
+        ...history,
+        { role: 'user', content: latestMsg },
       ];
 
       const response = await fetch(`${AI_SERVER_URL}/v1/chat/completions`, {
