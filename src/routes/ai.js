@@ -42,6 +42,7 @@ function ruleHandle(message, context) {
   return null;
 }
 
+console.log('[AI Routes] Loading /api/ai/* routes...');
 module.exports = (app) => {
   const router = express.Router();
 
