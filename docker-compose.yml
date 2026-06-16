@@ -14,6 +14,7 @@ services:
       - STORAGE_S3_ACCESS_KEY=${STORAGE_S3_ACCESS_KEY:-}
       - STORAGE_S3_SECRET_KEY=${STORAGE_S3_SECRET_KEY:-}
       - STORAGE_S3_REGION=${STORAGE_S3_REGION:-us-east-1}
+      - AI_SERVER_URL=${AI_SERVER_URL:-http://llama-ai:8080}
     depends_on:
       db:
         condition: service_healthy

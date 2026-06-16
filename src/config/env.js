@@ -25,4 +25,6 @@ function getAsrConfig() {
   return { base, key, enabled: !!key };
 }
 
-module.exports = { s3Endpoint, s3Bucket, s3AccessKey, s3SecretKey, s3Region, s3ForcePathStyle, useS3, PORT, JWT_SECRET, getAsrConfig };
+const AI_SERVER_URL = (process.env.AI_SERVER_URL || 'http://localhost:5328').replace(/\/$/, '');
+
+module.exports = { s3Endpoint, s3Bucket, s3AccessKey, s3SecretKey, s3Region, s3ForcePathStyle, useS3, PORT, JWT_SECRET, AI_SERVER_URL, getAsrConfig };

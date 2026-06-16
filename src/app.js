@@ -106,5 +106,6 @@ require('./routes/admin')(app, { authenticateToken, authenticateAdmin, upload })
 require('./routes/retry')(app, { authenticateToken, resolveApprovalOrgId, checkApprovalBypass, resolveFundSendChainParts, fundSendRetryStatuses, hasAdminOrEditorAccess });
 require('./routes/approvals')(app, { authenticateToken, hasAdminOrEditorAccess, checkPermission, createNotification, getOrgAdminUserIds, resolveApprovalOrgId, parsePendingData });
 require('./routes/transactions')(app, { authenticateToken, hasBookAccess, checkPermission, hasAdminOrEditorAccess, checkApprovalBypass, createNotification, getOrgAdminUserIds, maybeMirrorOrgTxnToCreatorPersonal, getChainRemainingBalance, mustUseChangeDeleteApprovalFlow, getRequiredApproversForChangeDelete, buildChangeDeletePendingData, syncCounterpartLegsForChangeDelete, notifyChangeDeleteApprovers, buildChangeDeleteNotification, deleteCounterpartLegsForChangeDelete, reverseTxnBalanceForRemoval, generateChainId, fundSendRetryStatuses, resolveApprovalOrgId, resolveFundSendChainParts, parsePendingData, parseClientDateTime, enrichTxn, DEFAULT_CATEGORIES });
+require('./routes/ai')(app);
 
 module.exports = app;
