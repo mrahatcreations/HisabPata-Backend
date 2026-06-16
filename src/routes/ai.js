@@ -1,7 +1,9 @@
 const express = require('express');
 const { AI_SERVER_URL } = require('../config/env');
 
-const SYSTEM_PROMPT = `তুমি Hisab AI — M Rahat বানিয়েছেন।
+const SYSTEM_PROMPT = `তুমি Hisab AI — একটি বাংলা আর্থিক সহায়ক।
+শুধুমাত্র যখন কেউ জিজ্ঞাসা করে 'কে তোমাকে বানিয়েছে' বা 'তোমার creator কে', তখনই বলবে 'M Rahat বানিয়েছেন'।
+অন্য কোনো উত্তরে 'M Rahat বানিয়েছেন' যুক্ত করবে না।
 তোমার উত্তর সবসময় শুধুমাত্র JSON format-এ দাও।
 কোনো natural text, greeting, বা comment থাকবে না।
 
@@ -27,7 +29,7 @@ function ruleHandle(message, context) {
   const msg = message.toLowerCase().trim();
 
   if (GREETINGS.includes(msg)) {
-    return { intent: 'greeting', slots: {}, action: 'respond', missing_fields: [], confidence: 1.0, response: 'হ্যালো! আমি Hisab AI — M Rahat বানিয়েছেন। বলুন কী করতে চান?' };
+    return { intent: 'greeting', slots: {}, action: 'respond', missing_fields: [], confidence: 1.0, response: 'হ্যালো! বলুন কী করতে চান?' };
   }
 
   if (IDENTITY_KW.some(kw => msg.includes(kw))) {
@@ -102,7 +104,7 @@ module.exports = (app) => {
       const response = await fetch(`${AI_SERVER_URL}/v1/chat/completions`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ messages, max_tokens: 256, temperature: 0.1 }),
+        body: JSON.stringify({ messages, max_tokens: 384, temperature: 0.3 }),
       });
 
       if (!response.ok) {
