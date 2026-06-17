@@ -78,7 +78,7 @@ const handleApprove = async (ctx) => {
     }
   }
 
-  // Handle pendingAction transactions (edit/delete requests)
+  // Handle pendingAction transactions (edit/delete/org_fund requests)
   if (txn.pendingAction) {
     if (txn.pendingAction === 'edit') {
       const updatedPendingData = recordChangeDeleteApproval(txn.pendingData, req.user.id, txnId);
@@ -142,6 +142,67 @@ const handleApprove = async (ctx) => {
         await createNotification(pd.requestedBy, 'EDIT_APPROVED', 'সম্পাদনা অনুমোদিত', `আপনার অনুরোধ করা ${txn.amount} টাকার এন্ট্রি সম্পাদনা অনুমোদিত হয়েছে।`, txnId, null);
       }
       return res.json({ transaction: updated, message: 'Edit approved' });
+    } else if (txn.pendingAction === 'org_fund') {
+      const pd = parsePendingData(txn.pendingData);
+      const updatedPd = {
+        ...pd,
+        approvals: [...(pd.approvals || []), req.user.id]
+      };
+      const required = pd.requiredApprovers || [];
+      const isFullyApproved = required.length === 0 ||
+        required.every(id => updatedPd.approvals.includes(id));
+
+      if (!isFullyApproved) {
+        const updates = [];
+        updates.push(
+          prisma.transaction.update({
+            where: { id: txnId },
+            data: { pendingData: updatedPd }
+          })
+        );
+        if (txn.linkedTransactionId) {
+          updates.push(
+            prisma.transaction.update({
+              where: { id: txn.linkedTransactionId },
+              data: { pendingData: updatedPd }
+            })
+          );
+        }
+        await prisma.$transaction(updates);
+        broadcast({ type: 'data_changed' });
+        return res.json({ message: { bn: 'অনুমোদন গৃহীত হয়েছে। আরো অনুমোদন প্রয়োজন।', en: 'Approval recorded. More approvals needed.' } });
+      }
+
+      await prisma.$transaction(async (tx) => {
+        await tx.transaction.update({
+          where: { id: txnId },
+          data: {
+            reconStatus: 'approved',
+            pendingAction: null,
+            pendingData: null,
+            updateHistory: [...(txn.updateHistory || []), approveHistoryEntry]
+          }
+        });
+        if (txn.linkedTransactionId) {
+          await tx.transaction.update({
+            where: { id: txn.linkedTransactionId },
+            data: {
+              reconStatus: 'approved',
+              pendingAction: null,
+              pendingData: null,
+              updateHistory: [...(txn.updateHistory || []), approveHistoryEntry]
+            }
+          });
+        }
+      });
+
+      broadcast({ type: 'data_changed' });
+      await createNotification(pd.requestedBy, 'ORG_FUND_APPROVED',
+        'তহবিল ব্যবহার অনুমোদিত / Fund usage approved',
+        `আপনার ${pd.amount || txn.amount} টাকার তহবিল ব্যবহার অনুমোদিত হয়েছে। / Your ${pd.amount || txn.amount} Tk fund usage has been approved.`,
+        txnId, null);
+      const updated = await prisma.transaction.findUnique({ where: { id: txnId } });
+      return res.json({ transaction: updated, message: { bn: 'তহবিল ব্যবহার অনুমোদিত', en: 'Fund usage approved' } });
     } else if (txn.pendingAction === 'delete') {
       const updatedPendingData = recordChangeDeleteApproval(txn.pendingData, req.user.id, txnId);
       if (!isChangeDeleteFullyApproved(updatedPendingData)) {
@@ -172,7 +233,7 @@ const handleApprove = async (ctx) => {
           const balanceAdjustment = txn.type === 'expense' ? txn.amount : -txn.amount;
           await tx.book.update({ where: { id: txn.bookId }, data: { balance: { increment: balanceAdjustment } } });
         }
-        
+
         const legs = await getCounterpartLegsForChangeDelete(txn, txnBook, tx);
         for (const leg of legs) {
           if (isSend) {

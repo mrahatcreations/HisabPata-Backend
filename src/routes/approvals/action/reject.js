@@ -12,6 +12,69 @@ const handleReject = async (ctx) => {
   const { hasAdminOrEditorAccess, checkPermission, createNotification, getOrgAdminUserIds, parsePendingData } = deps;
 
   if (txn.pendingAction) {
+    if (txn.pendingAction === 'org_fund') {
+      const pd = parsePendingData(txn.pendingData);
+      const orgBookId = pd?.orgBookId || txn.orgFundId;
+      const amount = pd?.amount || txn.amount;
+
+      // Determine which leg is personal vs org counterpart
+      const isPersonalLeg = book?.organization?.isPersonal;
+      const personalTxnId = isPersonalLeg ? txnId : txn.linkedTransactionId;
+      const orgCounterpartId = isPersonalLeg ? txn.linkedTransactionId : txnId;
+
+      await prisma.$transaction(async (tx) => {
+        // Reverse org book balance
+        if (orgBookId) {
+          await tx.book.update({
+            where: { id: orgBookId },
+            data: { balance: { increment: amount } }
+          });
+        }
+
+        // Delete org counterpart (regardless of which leg was rejected)
+        if (orgCounterpartId) {
+          const counterpart = await tx.transaction.findUnique({
+            where: { id: orgCounterpartId }
+          });
+          if (counterpart) {
+            await tx.transaction.delete({
+              where: { id: orgCounterpartId }
+            });
+          }
+        }
+
+        // Set personal txn to rejected — keep orgFundId intact, no balance reversal
+        if (personalTxnId) {
+          const mainVer = await tx.transaction.findUnique({
+            where: { id: personalTxnId },
+            select: { version: true, updateHistory: true }
+          });
+          if (!mainVer) throw new Error('Personal transaction not found');
+          const upd = await tx.transaction.updateMany({
+            where: { id: personalTxnId, version: mainVer.version },
+            data: {
+              reconStatus: 'rejected',
+              pendingAction: null,
+              pendingData: null,
+              linkedTransactionId: null,
+              version: { increment: 1 },
+              updateHistory: [...(mainVer.updateHistory || []), rejectHistoryEntry]
+            }
+          });
+          if (upd.count === 0) throw new Error('Concurrency conflict on org_fund reject');
+        }
+      });
+
+      if (pd?.requestedBy) {
+        await createNotification(pd.requestedBy, 'ORG_FUND_REJECTED',
+          'তহবিল ব্যবহার প্রত্যাখ্যান / Fund usage rejected',
+          `আপনার তহবিল ব্যবহারের অনুরোধ প্রত্যাখ্যান করা হয়েছে। / Your fund usage request has been rejected.`,
+          personalTxnId || txnId, null);
+      }
+      broadcast({ type: 'data_changed' });
+      return res.json({ message: { bn: 'তহবিল ব্যবহার প্রত্যাখ্যান করা হয়েছে, অর্গ ব্যালেন্স ফেরত নেয়া হয়েছে', en: 'Fund usage rejected, org balance reversed' } });
+    }
+
     const pd = txn.pendingData;
     if (pd && book) {
       const pdObj = parsePendingData(pd);

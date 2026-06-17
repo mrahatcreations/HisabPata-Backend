@@ -3,6 +3,7 @@ const chain = require('./chain');
 const fund = require('./fund');
 const mirror = require('./mirror');
 const misc = require('./misc');
+const transitionOrgFund = require('./transitionOrgFund');
 
 module.exports = {
   ...access,
@@ -10,4 +11,5 @@ module.exports = {
   ...fund,
   ...mirror,
   ...misc,
+  ...transitionOrgFund,
 };

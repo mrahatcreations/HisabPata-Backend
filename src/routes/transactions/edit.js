@@ -2,7 +2,7 @@ const { prisma } = require('../../config/database');
 const { broadcast, broadcastToUser, broadcastToUsers } = require('../../websocket');
 
 module.exports = function(app, deps) {
-  const { authenticateToken, hasBookAccess, checkPermission, hasAdminOrEditorAccess, checkApprovalBypass, createNotification, getOrgAdminUserIds, maybeMirrorOrgTxnToCreatorPersonal, getChainRemainingBalance, mustUseChangeDeleteApprovalFlow, getRequiredApproversForChangeDelete, buildChangeDeletePendingData, syncCounterpartLegsForChangeDelete, notifyChangeDeleteApprovers, buildChangeDeleteNotification, deleteCounterpartLegsForChangeDelete, reverseTxnBalanceForRemoval, generateChainId, fundSendRetryStatuses, resolveApprovalOrgId, resolveFundSendChainParts, parsePendingData, parseClientDateTime, enrichTxn, DEFAULT_CATEGORIES } = deps;
+  const { authenticateToken, hasBookAccess, checkPermission, hasAdminOrEditorAccess, checkApprovalBypass, createNotification, getOrgAdminUserIds, maybeMirrorOrgTxnToCreatorPersonal, getChainRemainingBalance, mustUseChangeDeleteApprovalFlow, getRequiredApproversForChangeDelete, buildChangeDeletePendingData, syncCounterpartLegsForChangeDelete, notifyChangeDeleteApprovers, buildChangeDeleteNotification, deleteCounterpartLegsForChangeDelete, reverseTxnBalanceForRemoval, generateChainId, fundSendRetryStatuses, resolveApprovalOrgId, resolveFundSendChainParts, parsePendingData, parseClientDateTime, enrichTxn, DEFAULT_CATEGORIES, handleOrgFundTransition } = deps;
 
 // --- EDIT TRANSACTION ---
 app.put('/api/transactions/:id', authenticateToken, async (req, res) => {
@@ -34,6 +34,14 @@ app.put('/api/transactions/:id', authenticateToken, async (req, res) => {
     const isAdminOrEditor = await hasAdminOrEditorAccess(book.organizationId, req.user.id);
 
     if (isSend) {
+      // ── Block recipient change on any Send, regardless of state ──
+      if (recipientUserId !== undefined && recipientUserId !== txn.recipientUserId) {
+        return res.status(400).json({ error: { bn: 'Send লেনদেনের প্রাপক পরিবর্তন করা যাবে না।', en: 'Cannot change recipient on a Send transaction.' } });
+      }
+      if (recipientOrgId !== undefined && recipientOrgId !== txn.recipientOrgId) {
+        return res.status(400).json({ error: { bn: 'Send লেনদেনের প্রাপক প্রতিষ্ঠান পরিবর্তন করা যাবে না।', en: 'Cannot change recipient organization on a Send transaction.' } });
+      }
+
       // Send transaction rules
       if (isPending) {
         // Receiver cannot edit pending transactions
@@ -148,15 +156,37 @@ app.put('/api/transactions/:id', authenticateToken, async (req, res) => {
     const parsedAmount = changes.amount !== undefined ? changes.amount : txn.amount;
     const parsedType = changes.type !== undefined ? changes.type : txn.type;
 
-    if (changes.recipientUserId !== undefined && changes.recipientUserId !== txn.recipientUserId && txn.category === 'Send') {
-      return res.status(400).json({ error: 'Cannot change recipient on a Send transaction' });
-    }
-
     if (txn.pendingAction) {
       return res.status(400).json({ error: 'Transaction is already pending an approval for edit or delete.' });
     }
 
     const user = await prisma.user.findUnique({ where: { id: req.user.id }, select: { name: true } });
+
+    // ── Detect org fund transition: personal → org fund ──
+    const isAddingOrgFund =
+      !txn.pendingAction &&
+      !isSend &&
+      book.organization.isPersonal &&
+      !txn.orgFundId &&
+      changes.orgFundId;
+
+    if (isAddingOrgFund) {
+      return await handleOrgFundTransition(req, res, deps, {
+        txn, book, user, changes,
+        parsedAmount,
+        parsedType: finalType,
+      });
+    }
+
+    // ── Block removing orgFundId from rejected org_fund transition txn ──
+    if (
+      isRejected &&
+      txn.orgFundId &&
+      book.organization.isPersonal &&
+      changes.orgFundId === null
+    ) {
+      return res.status(400).json({ error: { bn: 'প্রত্যাখ্যাত ট্রানজিশন এন্ট্রি থেকে তহবিল সংযোগ সরানো যাবে না।', en: 'Cannot remove org fund association from a rejected transition entry.' } });
+    }
 
     // ── Send transaction edit logic based on state ──
     let mustApprove = false;
@@ -177,7 +207,13 @@ app.put('/api/transactions/:id', authenticateToken, async (req, res) => {
         mustApprove = await mustUseChangeDeleteApprovalFlow(txn, book, req.user.id);
       }
     } else {
-      mustApprove = await mustUseChangeDeleteApprovalFlow(txn, book, req.user.id);
+      // Personal org fund rejected txns: skip approval, direct edit only
+      const isRejectedOrgFund = isRejected && book.organization.isPersonal && txn.orgFundId;
+      if (isRejectedOrgFund) {
+        mustApprove = false;
+      } else {
+        mustApprove = await mustUseChangeDeleteApprovalFlow(txn, book, req.user.id);
+      }
     }
 
     const requiredApprovers = await getRequiredApproversForChangeDelete(txn, book, req.user.id);
@@ -194,22 +230,33 @@ app.put('/api/transactions/:id', authenticateToken, async (req, res) => {
       if (isPendingOrRejectedSend) {
         if (changes.amount !== undefined && changes.amount !== txn.amount) {
           // Both Pending and Rejected: balance was already applied and never reversed.
-          // Adjust for amount difference only.
-          if (txn.type === 'expense') balanceAdjustment = txn.amount - parsedAmount;
-          else if (txn.type === 'income') balanceAdjustment = parsedAmount - txn.amount;
+          // Reverse the old effect and apply the new effect (accounting for possible type change).
+          const reverseOld = txn.type === 'expense' ? txn.amount : -txn.amount;
+          const applyNew = parsedType === 'expense' ? -parsedAmount : parsedAmount;
+          balanceAdjustment = reverseOld + applyNew;
         }
       } else {
-        if (isRejected) {
+        if (isRejected && book.organization.isPersonal && txn.orgFundId) {
+          // Org fund transition rejected: balance was NEVER reversed on personal book.
+          // Only adjust for amount/type changes (differential).
+          if (changes.amount !== undefined && changes.amount !== txn.amount) {
+            const reverseOld = txn.type === 'expense' ? txn.amount : -txn.amount;
+            const applyNew = parsedType === 'expense' ? -parsedAmount : parsedAmount;
+            balanceAdjustment = reverseOld + applyNew;
+          }
+        } else if (isRejected) {
           // If a non-Send transaction was rejected, its balance was FULLY reversed.
-          // Retrying it means we must apply the new amount in full.
-          if (txn.type === 'expense') balanceAdjustment = -parsedAmount;
-          else if (txn.type === 'income') balanceAdjustment = parsedAmount;
+          // Retrying it means we must apply the new amount in full (accounting for possible type change).
+          if (parsedType === 'expense') balanceAdjustment = -parsedAmount;
+          else if (parsedType === 'income') balanceAdjustment = parsedAmount;
         } else if (
           changes.amount !== undefined &&
           changes.amount !== txn.amount
         ) {
-          if (txn.type === 'expense') balanceAdjustment = txn.amount - parsedAmount;
-          else if (txn.type === 'income') balanceAdjustment = parsedAmount - txn.amount;
+          // Reverse the old effect and apply the new effect (accounting for possible type change).
+          const reverseOld = txn.type === 'expense' ? txn.amount : -txn.amount;
+          const applyNew = parsedType === 'expense' ? -parsedAmount : parsedAmount;
+          balanceAdjustment = reverseOld + applyNew;
         }
       }
 
