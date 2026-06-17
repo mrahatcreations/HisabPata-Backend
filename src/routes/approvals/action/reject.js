@@ -114,7 +114,8 @@ const handleReject = async (ctx) => {
           if (leg.pendingAction === 'delete') {
             const legIsSend = leg.category === 'Send';
             if (!legIsSend) {
-              legDelta = legPd.oldType === 'expense' ? -legPd.oldAmount : legPd.oldAmount;
+              // Use leg's own type (not source's oldType from pendingData) for correct balance restoration
+              legDelta = leg.type === 'expense' ? -leg.amount : leg.amount;
             }
           }
           if (legDelta !== 0) {
@@ -125,18 +126,23 @@ const handleReject = async (ctx) => {
           }
           const legVer = await tx.transaction.findUnique({ where: { id: leg.id }, select: { version: true } });
           if (!legVer) continue;
+          const legRestoreData = {
+            reconStatus: 'approved',
+            pendingAction: null,
+            pendingData: null,
+            version: { increment: 1 }
+          };
+          // For delete: counterpart leg data was never modified during pending phase,
+          // only pendingAction/pendingData were set. Don't overwrite amount/type/category/note.
+          if (leg.pendingAction !== 'delete') {
+            legRestoreData.amount = legPd.oldAmount;
+            legRestoreData.type = legPd.oldType;
+            legRestoreData.category = legPd.oldCategory;
+            legRestoreData.note = legPd.oldNote;
+          }
           const updL = await tx.transaction.updateMany({
             where: { id: leg.id, version: legVer.version },
-            data: {
-              amount: legPd.oldAmount,
-              type: legPd.oldType,
-              category: legPd.oldCategory,
-              note: legPd.oldNote,
-              reconStatus: 'approved',
-              pendingAction: null,
-              pendingData: null,
-              version: { increment: 1 }
-            }
+            data: legRestoreData
           });
           if (updL.count === 0) throw new Error('Concurrency conflict on counterpart pendingAction reject');
         }
