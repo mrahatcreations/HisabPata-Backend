@@ -44,6 +44,9 @@ app.put('/api/transactions/:id', authenticateToken, async (req, res) => {
       if (recipientOrgId !== undefined && recipientOrgId !== txn.recipientOrgId) {
         return res.status(400).json({ error: { bn: 'Send লেনদেনের প্রাপক প্রতিষ্ঠান পরিবর্তন করা যাবে না।', en: 'Cannot change recipient organization on a Send transaction.' } });
       }
+      if (category !== undefined && category !== txn.category) {
+        return res.status(400).json({ error: { bn: 'Send লেনদেনের ক্যাটাগরি পরিবর্তন করা যাবে না।', en: 'Cannot change category on a Send transaction.' } });
+      }
 
       // Send transaction rules
       if (isPending) {

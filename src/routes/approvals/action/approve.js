@@ -423,6 +423,15 @@ const handleApprove = async (ctx) => {
         });
         if (upd1.count === 0) throw new Error('Concurrency conflict on pending_recipient approve');
 
+        // NEW LOGIC: Increment receiver balance upon approval (it is no longer incremented on creation)
+        if (txn.category === 'Send') {
+          const balanceAdj = txn.type === 'income' ? txn.amount : -txn.amount;
+          await tx.book.update({
+            where: { id: txn.bookId },
+            data: { balance: { increment: balanceAdj } }
+          });
+        }
+
         if (txn.linkedTransactionId) {
           const linked = await tx.transaction.findUnique({ where: { id: txn.linkedTransactionId }, select: { version: true, updateHistory: true } });
           if (linked) {

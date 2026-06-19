@@ -95,14 +95,25 @@ const handleReject = async (ctx) => {
 
         const mainVer = await tx.transaction.findUnique({ where: { id: txnId }, select: { version: true } });
         if (!mainVer) throw new Error('Transaction not found');
+        const isSendReject = txn.category === 'Send';
+        const updateData = {
+          amount: pdObj.oldAmount,
+          note: pdObj.oldNote,
+          reconStatus: 'approved',
+          pendingAction: null,
+          pendingData: null,
+          version: { increment: 1 }
+        };
+        
+        if (!isSendReject) {
+          updateData.type = pdObj.oldType;
+          updateData.category = pdObj.oldCategory;
+          updateData.recipientUserId = pdObj.oldRecipientUserId || null;
+        }
+
         const upd = await tx.transaction.updateMany({
           where: { id: txnId, version: mainVer.version },
-          data: {
-            amount: pdObj.oldAmount, type: pdObj.oldType, category: pdObj.oldCategory,
-            note: pdObj.oldNote, recipientUserId: pdObj.oldRecipientUserId || null,
-            reconStatus: 'approved', pendingAction: null, pendingData: null,
-            version: { increment: 1 }
-          }
+          data: updateData
         });
         if (upd.count === 0) throw new Error('Concurrency conflict on pendingAction reject restore');
 
@@ -239,12 +250,10 @@ const handleReject = async (ctx) => {
         incomeLeg = linkedCurrent;
       }
 
-      // Delete income leg and reverse its balance
+      // Wait, since we no longer increment the receiver's balance on creation, we DO NOT decrement it on rejection either!
+      // And we explicitly do NOT refund the sender's expense leg balance per user request.
       if (incomeLeg) {
-        await tx.book.update({
-          where: { id: incomeLeg.bookId },
-          data: { balance: { decrement: incomeLeg.amount } }
-        });
+        // Balance was never incremented, so no decrement needed. Just delete the leg.
         await tx.transaction.delete({ where: { id: incomeLeg.id } });
       }
 

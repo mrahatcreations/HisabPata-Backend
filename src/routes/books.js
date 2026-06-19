@@ -33,6 +33,18 @@ module.exports = function(app, { authenticateToken, recalculateBookBalance }) {
       await Promise.all(booksWithRole.map(async (book) => {
         const calculated = await recalculateBookBalance(book.id);
         if (calculated !== null) book.balance = calculated;
+
+        // Calculate Pending Balance (income that is waiting for approval)
+        const pendingIncomeAgg = await prisma.transaction.aggregate({
+          where: { 
+            bookId: book.id, 
+            type: 'income', 
+            category: 'Send',
+            reconStatus: { in: ['pending', 'pending_recipient', 'pending_org'] }
+          },
+          _sum: { amount: true }
+        });
+        book.pendingBalance = pendingIncomeAgg._sum.amount || 0;
       }));
 
       // Include mock pending books for pending memberships so they show in the list with a pending state

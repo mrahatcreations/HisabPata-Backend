@@ -128,7 +128,7 @@ module.exports = async (ctx) => {
 
     await prisma.book.update({ where: { id: bookId }, data: { balance: { decrement: parsedAmount } } });
     await prisma.book.update({ where: { id: fundBook.id }, data: { balance: { decrement: parsedAmount } } });
-    await prisma.book.update({ where: { id: recipientBook.id }, data: { balance: { increment: parsedAmount } } });
+    // Removed recipient balance increment during pending state
 
     await prisma.transaction.update({
       where: { id: personalTxn.id },

@@ -111,6 +111,10 @@ app.delete('/api/transactions/:id', authenticateToken, async (req, res) => {
     const executeHardDelete = async () => {
       await prisma.$transaction(async (prisma) => {
         let balanceAdjustment = reverseTxnBalanceForRemoval(txn);
+        // Previously: if (!isSend && txn.reconStatus === 'rejected') balanceAdjustment = 0;
+        // NEW LOGIC: A rejected Send transaction DID NOT refund the sender upon rejection.
+        // Therefore, when it is FINALLY deleted, the balance MUST be reversed (refunded)!
+        // So for Send, balanceAdjustment remains as reverseTxnBalanceForRemoval(txn).
         if (!isSend && txn.reconStatus === 'rejected') {
           balanceAdjustment = 0;
         }
@@ -222,6 +226,8 @@ app.delete('/api/transactions/:id/permanent', authenticateToken, async (req, res
 
     await prisma.$transaction(async (tx) => {
       const isSendLocal = txn.category === 'Send';
+      // NEW LOGIC: isSendLocal transactions that are rejected were NEVER reversed.
+      // Therefore, they MUST be reversed when permanently deleted!
       const alreadyReversed = (!isSendLocal && txn.reconStatus === 'rejected') || txn.reconStatus === 'delete_rejected' || !!txn.pendingAction;
       if (!alreadyReversed) {
         const balanceAdj = txn.type === 'expense' ? txn.amount : -txn.amount;
