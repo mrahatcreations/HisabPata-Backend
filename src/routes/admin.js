@@ -569,6 +569,7 @@ app.post('/api/admin/keywords/rebuild', authenticateAdmin, async (req, res) => {
     // Stream all transactions with notes in batches of 500
     const BATCH_SIZE = 500;
     let skip = 0;
+    let totalScanned = 0;
     const wordMap = {};
 
     while (true) {
@@ -577,8 +578,11 @@ app.post('/api/admin/keywords/rebuild', authenticateAdmin, async (req, res) => {
         select: { note: true },
         take: BATCH_SIZE,
         skip,
+        orderBy: { id: 'asc' } // Guarantee order for stable pagination
       });
+      
       if (batch.length === 0) break;
+      totalScanned += batch.length;
 
       for (const txn of batch) {
         if (!txn.note) continue;
@@ -612,7 +616,7 @@ app.post('/api/admin/keywords/rebuild', authenticateAdmin, async (req, res) => {
     res.json({
       message: 'Keyword index rebuilt successfully',
       uniqueWords: inserted,
-      transactionsScanned: skip,
+      transactionsScanned: totalScanned,
     });
   } catch (error) {
     console.error('[Admin] Failed to rebuild keyword index:', error);
