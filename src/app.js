@@ -96,6 +96,7 @@ require('./routes/org')(app);
 require('./routes/user')(app);
 require('./routes/books')(app, { authenticateToken, recalculateBookBalance });
 require('./routes/categories')(app, { authenticateToken });
+require('./routes/keywords')(app, { authenticateToken });
 require('./routes/notifications')(app, { authenticateToken });
 require('./routes/notificationPreferences')(app, { authenticateToken });
 require('./routes/fcm')(app, { authenticateToken });

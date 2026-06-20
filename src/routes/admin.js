@@ -488,4 +488,137 @@ app.delete('/api/admin/db/:model/:id', authenticateAdmin, async (req, res) => {
   }
 });
 
+// ─── Keyword Management ──────────────────────────────────────────────────────
+
+// GET /api/admin/keywords — paginated list with search filter
+app.get('/api/admin/keywords', authenticateAdmin, async (req, res) => {
+  try {
+    const { q = '', page = '1', limit = '50', sort = 'count' } = req.query;
+    const take = Math.min(parseInt(limit) || 50, 200);
+    const skip = (Math.max(parseInt(page) || 1, 1) - 1) * take;
+    const orderBy = sort === 'word' ? { word: 'asc' } : { count: 'desc' };
+
+    const where = q.trim().length > 0
+      ? { word: { contains: q.trim(), mode: 'insensitive' } }
+      : {};
+
+    const [keywords, total] = await Promise.all([
+      prisma.noteKeyword.findMany({ where, orderBy, take, skip }),
+      prisma.noteKeyword.count({ where }),
+    ]);
+
+    res.json({ keywords, total, page: parseInt(page), limit: take });
+  } catch (error) {
+    console.error('[Admin] Failed to fetch keywords:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// GET /api/admin/keywords/stats — summary stats
+app.get('/api/admin/keywords/stats', authenticateAdmin, async (req, res) => {
+  try {
+    const [total, topKeywords, agg] = await Promise.all([
+      prisma.noteKeyword.count(),
+      prisma.noteKeyword.findMany({ orderBy: { count: 'desc' }, take: 10 }),
+      prisma.noteKeyword.aggregate({ _sum: { count: true }, _avg: { count: true }, _max: { count: true } }),
+    ]);
+
+    res.json({
+      totalUniqueWords: total,
+      totalUsages: agg._sum.count || 0,
+      avgUsagesPerWord: Math.round((agg._avg.count || 0) * 10) / 10,
+      maxUsages: agg._max.count || 0,
+      topKeywords,
+    });
+  } catch (error) {
+    console.error('[Admin] Failed to fetch keyword stats:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// DELETE /api/admin/keywords/:word — delete a single keyword
+app.delete('/api/admin/keywords/:word', authenticateAdmin, async (req, res) => {
+  try {
+    const word = decodeURIComponent(req.params.word);
+    await prisma.noteKeyword.delete({ where: { word } });
+    res.json({ message: `Keyword "${word}" deleted` });
+  } catch (error) {
+    if (error.code === 'P2025') return res.status(404).json({ error: 'Keyword not found' });
+    console.error('[Admin] Failed to delete keyword:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// DELETE /api/admin/keywords — clear all keywords
+app.delete('/api/admin/keywords', authenticateAdmin, async (req, res) => {
+  try {
+    const { count } = await prisma.noteKeyword.deleteMany();
+    res.json({ message: `Cleared ${count} keywords` });
+  } catch (error) {
+    console.error('[Admin] Failed to clear keywords:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// POST /api/admin/keywords/rebuild — rebuild keyword index from all existing transaction notes
+app.post('/api/admin/keywords/rebuild', authenticateAdmin, async (req, res) => {
+  try {
+    // Clear existing index
+    await prisma.noteKeyword.deleteMany();
+
+    // Stream all transactions with notes in batches of 500
+    const BATCH_SIZE = 500;
+    let skip = 0;
+    const wordMap = {};
+
+    while (true) {
+      const batch = await prisma.transaction.findMany({
+        where: { note: { not: null } },
+        select: { note: true },
+        take: BATCH_SIZE,
+        skip,
+      });
+      if (batch.length === 0) break;
+
+      for (const txn of batch) {
+        if (!txn.note) continue;
+        const rawWords = txn.note.trim().split(/\s+/);
+        for (const w of rawWords) {
+          const clean = w.replace(/[.,\/#!$%\^&\*;:{}=\-_`~()।??"''""]/g, '').trim();
+          if (clean.length > 1) {
+            wordMap[clean] = (wordMap[clean] || 0) + 1;
+          }
+        }
+      }
+      skip += BATCH_SIZE;
+    }
+
+    // Bulk upsert unique words
+    const entries = Object.entries(wordMap);
+    let inserted = 0;
+    const UPSERT_BATCH = 100;
+    for (let i = 0; i < entries.length; i += UPSERT_BATCH) {
+      const slice = entries.slice(i, i + UPSERT_BATCH);
+      await Promise.all(slice.map(([word, count]) =>
+        prisma.noteKeyword.upsert({
+          where: { word },
+          update: { count },
+          create: { word, count },
+        })
+      ));
+      inserted += slice.length;
+    }
+
+    res.json({
+      message: 'Keyword index rebuilt successfully',
+      uniqueWords: inserted,
+      transactionsScanned: skip,
+    });
+  } catch (error) {
+    console.error('[Admin] Failed to rebuild keyword index:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 };
+

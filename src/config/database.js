@@ -25,6 +25,11 @@ const prisma = prismaBase.$extends({
         txExecutions.set(result.id, dupCount);
 
         console.log(`[STRICT_DEBUG_TXN] | FLOW_ID: ${ctx.flowId} | STEP: ${ctx.step.current} | REASON: ${ctx.reason} | EVENT: CREATE | TXN_ID: ${result.id} | CREATED: ${result.createdAt} | STATUS_AFTER: ${result.reconStatus} | PEND_AFTER: ${result.pendingAction} | LINKED: ${result.linkedTransactionId} | ORG_FUND: ${result.orgFundId} | APPLIED: ${result.applied} | DUP_EXEC_COUNT: ${dupCount} | REQ_ID: ${ctx.flowId}`);
+        
+        if (result.note) {
+          handleNoteKeywords(result.note, '').catch(err => console.error(err));
+        }
+
         return result;
       },
       async update({ args, query }) {
@@ -42,6 +47,34 @@ const prisma = prismaBase.$extends({
         txExecutions.set(result.id, dupCount);
 
         console.log(`[STRICT_DEBUG_TXN] | FLOW_ID: ${ctx.flowId} | STEP: ${ctx.step.current} | REASON: ${ctx.reason} | EVENT: UPDATE | TXN_ID: ${result.id} | CREATED: ${result.createdAt} | STATUS_BEFORE: ${beforeSnapshot?.reconStatus} | STATUS_AFTER: ${result.reconStatus} | PEND_BEFORE: ${beforeSnapshot?.pendingAction} | PEND_AFTER: ${result.pendingAction} | LINKED: ${result.linkedTransactionId} | ORG_FUND: ${result.orgFundId} | APPLIED: ${result.applied} | DUP_EXEC_COUNT: ${dupCount} | REQ_ID: ${ctx.flowId}`);
+        
+        if (beforeSnapshot) {
+          const oldNote = beforeSnapshot.note || '';
+          const newNote = result.note || '';
+          if (oldNote !== newNote) {
+            handleNoteKeywords(newNote, oldNote).catch(err => console.error(err));
+          }
+        } else if (result.note) {
+          handleNoteKeywords(result.note, '').catch(err => console.error(err));
+        }
+
+        return result;
+      },
+      async delete({ args, query }) {
+        const ctx = requestContext.getStore() || { flowId: 'UNKNOWN', step: { current: 0 }, reason: 'untracked' };
+        ctx.step.current += 1;
+
+        let beforeSnapshot = null;
+        if (args.where && args.where.id) {
+          beforeSnapshot = await prismaBase.transaction.findUnique({ where: args.where });
+        }
+
+        const result = await query(args);
+
+        if (beforeSnapshot && beforeSnapshot.note) {
+          handleNoteKeywords('', beforeSnapshot.note).catch(err => console.error(err));
+        }
+
         return result;
       },
       async updateMany({ args, query }) {
@@ -92,5 +125,59 @@ const prisma = prismaBase.$extends({
     }
   }
 });
+
+function extractKeywords(note) {
+  if (!note) return [];
+  const rawWords = note.trim().split(/\s+/);
+  const keywords = [];
+  for (const w of rawWords) {
+    const clean = w.replace(/[.,\/#!$%\^&\*;:{}=\-_`~()।??"'’“”]/g, "").trim();
+    if (clean.length > 1) {
+      keywords.push(clean);
+    }
+  }
+  return [...new Set(keywords)];
+}
+
+async function handleNoteKeywords(newNote, oldNote) {
+  try {
+    const oldKeywords = extractKeywords(oldNote);
+    const newKeywords = extractKeywords(newNote);
+
+    const added = newKeywords.filter(w => !oldKeywords.includes(w));
+    const removed = oldKeywords.filter(w => !newKeywords.includes(w));
+
+    const promises = [];
+
+    for (const word of added) {
+      promises.push(
+        prismaBase.noteKeyword.upsert({
+          where: { word },
+          update: { count: { increment: 1 } },
+          create: { word, count: 1 }
+        })
+      );
+    }
+
+    for (const word of removed) {
+      promises.push(
+        prismaBase.noteKeyword.update({
+          where: { word },
+          data: { count: { decrement: 1 } }
+        }).then(async (res) => {
+          if (res.count <= 0) {
+            await prismaBase.noteKeyword.delete({ where: { word } }).catch(() => {});
+          }
+        }).catch(() => {})
+      );
+    }
+
+    if (promises.length > 0) {
+      await Promise.all(promises);
+    }
+  } catch (err) {
+    console.error('[DATABASE_KEYWORD_HELPER] Error processing keywords:', err);
+  }
+}
 
 module.exports = { prisma, prismaBase, requestContext, txExecutions, pool };

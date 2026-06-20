@@ -264,3 +264,10 @@ model Category {
 
   @@index([userId])
 }
+
+model NoteKeyword {
+  word      String   @id
+  count     Int      @default(1)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
