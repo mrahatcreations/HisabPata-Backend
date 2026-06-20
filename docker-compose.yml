@@ -15,6 +15,9 @@ services:
       - STORAGE_S3_SECRET_KEY=${STORAGE_S3_SECRET_KEY:-}
       - STORAGE_S3_REGION=${STORAGE_S3_REGION:-us-east-1}
       - AI_SERVER_URL=${AI_SERVER_URL:-http://llama-ai:8080}
+    networks:
+      - default
+      - seaweedfs-net
     depends_on:
       db:
         condition: service_healthy
@@ -51,3 +54,8 @@ services:
 
 volumes:
   pgdata:
+
+networks:
+  seaweedfs-net:
+    external: true
+    name: jhuktptxfqy73ifwx6zetx7a
