@@ -4,12 +4,16 @@
   "description": "Hisab Pata - Backend API Server",
   "main": "index.js",
   "scripts": {
+    "prestart": "node seed_keywords.js",
     "start": "node index.js",
     "dev": "node --watch index.js",
     "db:generate": "npx prisma generate",
     "db:push": "npx prisma db push",
     "db:migrate": "npx prisma migrate dev",
-    "seed": "node index.js"
+    "seed": "node seed_keywords.js"
+  },
+  "prisma": {
+    "seed": "node seed_keywords.js"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.750.0",
