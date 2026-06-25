@@ -65,7 +65,7 @@ const getRequiredApproversForChangeDelete = async (txn, book, requesterId) => {
         if (adminIds.length > 0) {
           return adminIds;
         } else if (admins.length > 0) {
-          return [requesterId];
+          return []; // If the requester is the ONLY admin, no other approvers are required
         }
       }
     }
@@ -101,7 +101,7 @@ const getRequiredApproversForChangeDelete = async (txn, book, requesterId) => {
           const adminIds = fundMembers.map(m => m.userId);
           const filtered = adminIds.filter(id => id !== requesterId);
           if (filtered.length > 0) return filtered;
-          if (adminIds.length > 0) return [requesterId];
+          if (adminIds.length > 0) return []; // If the requester is the ONLY admin, no other approvers are required
         }
       }
     }
@@ -111,6 +111,28 @@ const getRequiredApproversForChangeDelete = async (txn, book, requesterId) => {
 };
 
 const mustUseChangeDeleteApprovalFlow = async (txn, book, requesterId) => {
+  const required = await getRequiredApproversForChangeDelete(txn, book, requesterId);
+  if (required.length === 0) {
+    // If there is literally NO ONE ELSE to approve this request (e.g. requester is the only admin),
+    // forcing an approval flow will just get it stuck in pending state. Bypass it.
+    return false;
+  }
+
+  const pairedFund = await findFundVoucherPairedTxn(txn, book);
+  
+  // Exemption: Simple unlinked incomes (not Send, not fund vouchers) do not require approval
+  if (
+    txn.type === 'income' &&
+    !txn.linkedTransactionId &&
+    !txn.orgFundId &&
+    !pairedFund &&
+    txn.category !== 'Send' &&
+    !txn.recipientUserId &&
+    txn.chainType !== 'fund_send'
+  ) {
+    return false;
+  }
+
   if (book.organizationId) {
     const org = await prisma.organization.findUnique({
       where: { id: book.organizationId },
@@ -124,24 +146,11 @@ const mustUseChangeDeleteApprovalFlow = async (txn, book, requesterId) => {
     }
   }
 
-  const pairedFund = await findFundVoucherPairedTxn(txn, book);
-  if (
-    txn.type === 'income' &&
-    !txn.linkedTransactionId &&
-    !txn.orgFundId &&
-    !pairedFund &&
-    txn.category !== 'Send' &&
-    !txn.recipientUserId &&
-    txn.chainType !== 'fund_send'
-  ) {
-    return false;
-  }
   if (txn.linkedTransactionId) {
     const exists = await linkedBookExists(txn);
     if (!exists) return false;
   }
   if (txnHasLinkedChangeDeleteApproval(txn) || pairedFund) return true;
-  const required = await getRequiredApproversForChangeDelete(txn, book, requesterId);
   return required.length > 0;
 };
 
