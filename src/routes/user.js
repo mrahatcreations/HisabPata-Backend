@@ -224,8 +224,8 @@ module.exports = function(app) {
   app.post('/api/user/invitations/:orgId/action', authenticateToken, async (req, res) => {
     try {
       const { action } = req.body;
-      if (!['approve', 'reject'].includes(action)) {
-        return res.status(400).json({ error: 'Action must be "approve" or "reject"' });
+      if (!['approve', 'reject', 'cancel'].includes(action)) {
+        return res.status(400).json({ error: 'Action must be "approve", "reject", or "cancel"' });
       }
 
       const membership = await prisma.organizationMember.findUnique({
@@ -233,11 +233,14 @@ module.exports = function(app) {
         include: { organization: true }
       });
 
-      if (!membership || membership.status !== 'pending' || !membership.invitedById) {
-        return res.status(404).json({ error: 'Pending invitation not found' });
+      if (!membership || membership.status !== 'pending') {
+        return res.status(404).json({ error: 'Pending invitation/request not found' });
       }
 
       if (action === 'approve') {
+        if (!membership.invitedById) {
+          return res.status(400).json({ error: 'Cannot approve your own join request' });
+        }
         await prisma.organizationMember.update({
           where: { id: membership.id },
           data: { status: 'active' }
@@ -249,7 +252,7 @@ module.exports = function(app) {
         await prisma.organizationMember.delete({ where: { id: membership.id } });
         const { broadcast } = require('../websocket');
         broadcast({ type: "data_changed" });
-        return res.json({ message: 'Invitation rejected' });
+        return res.json({ message: action === 'cancel' ? 'Request cancelled' : 'Invitation rejected' });
       }
     } catch (error) {
       console.error('Invitation action error:', error);

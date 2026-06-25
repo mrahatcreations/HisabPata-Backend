@@ -104,6 +104,9 @@ const handleReject = async (ctx) => {
           pendingData: null,
           version: { increment: 1 }
         };
+        if (pdObj.oldTransactionTime) {
+          updateData.dateTime = pdObj.oldTransactionTime;
+        }
         
         if (!isSendReject) {
           updateData.type = pdObj.oldType;
@@ -151,6 +154,9 @@ const handleReject = async (ctx) => {
             legRestoreData.amount = legPd.oldAmount;
             legRestoreData.category = legPd.oldCategory;
             legRestoreData.note = legPd.oldNote;
+            if (legPd.oldTransactionTime) {
+              legRestoreData.dateTime = legPd.oldTransactionTime;
+            }
           }
           const updL = await tx.transaction.updateMany({
             where: { id: leg.id, version: legVer.version },

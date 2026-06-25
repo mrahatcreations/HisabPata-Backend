@@ -309,6 +309,7 @@ app.put('/api/transactions/:id', authenticateToken, async (req, res) => {
           if (changes.amount !== undefined) linkedChanges.amount = parsedAmount;
           if (changes.note !== undefined) linkedChanges.note = changes.note;
           if (changes.category !== undefined) linkedChanges.category = changes.category;
+          if (changes.dateTime !== undefined) linkedChanges.dateTime = changes.dateTime;
 
           // RECREATE DELETED RECEIVER LEG ON RETRY
           if (isEditOnRejected && isSend) {
@@ -476,6 +477,7 @@ app.put('/api/transactions/:id', authenticateToken, async (req, res) => {
         if (changes.amount !== undefined) linkedChanges.amount = parsedAmount;
         if (changes.note !== undefined) linkedChanges.note = changes.note;
         if (changes.category !== undefined) linkedChanges.category = changes.category;
+        if (changes.dateTime !== undefined) linkedChanges.dateTime = changes.dateTime;
         if (changes.contact !== undefined) linkedChanges.contact = changes.contact;
         if (changes.imageUrl !== undefined) linkedChanges.imageUrl = changes.imageUrl;
         if (changes.dateTime !== undefined) linkedChanges.dateTime = changes.dateTime;
